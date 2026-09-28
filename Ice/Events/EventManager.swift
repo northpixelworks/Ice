@@ -278,27 +278,42 @@ extension EventManager {
                 return
             }
 
-            // Get the window that the user has clicked into.
-            guard
-                let mouseLocation = MouseHelpers.locationCoreGraphics,
-                let windowUnderMouse = WindowInfo.createWindows(option: .onScreen)
-                    .filter({ $0.layer < CGWindowLevelForKey(.cursorWindow) })
-                    .first(where: { $0.bounds.contains(mouseLocation) && $0.title?.isEmpty == false }),
-                let owningApplication = windowUnderMouse.owningApplication
-            else {
+            // Get the window that the user has clicked into. Titles need Screen
+            // Recording, so limited mode falls back to owner and layer data.
+            guard let mouseLocation = MouseHelpers.locationCoreGraphics else {
+                return
+            }
+            let windows = WindowInfo.createWindows(option: .onScreen).map(SmartRehidePolicy.Window.init)
+            let titlesAvailable = SmartRehidePolicy.titlesAvailable(
+                permissionGranted: ScreenCapture.checkPermissions(),
+                windows: windows,
+                ownPID: ProcessInfo.processInfo.processIdentifier
+            )
+            guard let target = SmartRehidePolicy.clickedWindow(
+                in: windows,
+                at: mouseLocation,
+                titlesAvailable: titlesAvailable,
+                maximumLayer: Int(CGWindowLevelForKey(.cursorWindow)),
+                owner: SmartRehidePolicy.Owner.init(pid:)
+            ) else {
+                NSLog("[Ice SmartRehide] no clicked window found titlesAvailable=%d windows=%ld", titlesAvailable ? 1 : 0, windows.count)
                 return
             }
 
-            // The dock is an exception to the following check.
-            if owningApplication.bundleIdentifier != "com.apple.dock" {
-                // Only continue if the user has clicked into an active window with
-                // a regular activation policy.
-                guard
-                    owningApplication.isActive,
-                    owningApplication.activationPolicy == .regular
-                else {
-                    return
-                }
+            // Only continue if the user has clicked into an active window with a
+            // regular activation policy. The Dock is an exception.
+            let shouldRehide = SmartRehidePolicy.shouldRehide(owner: target.owner)
+            NSLog(
+                "[Ice SmartRehide] titlesAvailable=%d layer=%ld policy=%ld active=%d dock=%d rehide=%d",
+                titlesAvailable ? 1 : 0,
+                target.window.layer,
+                target.owner.activationPolicy.rawValue,
+                target.owner.isActive ? 1 : 0,
+                target.owner.bundleIdentifier == SmartRehidePolicy.dockBundleIdentifier ? 1 : 0,
+                shouldRehide ? 1 : 0
+            )
+            guard shouldRehide else {
+                return
             }
 
             // All checks have passed, so hide the sections.
