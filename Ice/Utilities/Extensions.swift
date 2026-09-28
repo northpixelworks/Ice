@@ -594,7 +594,7 @@ extension NSScreen {
     var appKitMenuBarFrame: CGRect {
         let menuBarWindow = WindowInfo.menuBarWindow(for: displayID)
         let options = NSApp.currentSystemPresentationOptions
-        let automaticallyHidden = Defaults.globalDomain["_HIHideMenuBar"] as? Bool == true ||
+        let automaticallyHidden = Defaults.MenuBarAutoHide.isEnabled() ||
             options.contains(.autoHideMenuBar) || options.contains(.hideMenuBar)
         // Window geometry is display-specific. NSMenu is a fallback for the
         // active screen when Screen Recording does not expose window names.

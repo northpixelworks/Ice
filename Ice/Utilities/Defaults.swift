@@ -136,6 +136,45 @@ enum Defaults {
 }
 
 extension Defaults {
+    /// The system "Automatically hide and show the menu bar" preference.
+    ///
+    /// Reading it copies the whole global domain, and pointer and scroll
+    /// handling ask for it on every event, so one read serves for a second.
+    /// `NSScreen` callers are not main-actor isolated, so a lock guards it.
+    enum MenuBarAutoHide {
+        static let maximumAge: TimeInterval = 1
+
+        /// Reads the stored preference. Tests substitute a counting reader.
+        static var read: () -> Bool = {
+            Defaults.globalDomain["_HIHideMenuBar"] as? Bool == true
+        }
+
+        private static let lock = NSLock()
+        private static var cached: (value: Bool, readAt: TimeInterval)?
+
+        static func isEnabled(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if let cached, now >= cached.readAt, now - cached.readAt < maximumAge {
+                return cached.value
+            }
+            let value = read()
+            if cached?.value != value {
+                NSLog("[Ice MenuBarAutoHide] preference read as %d", value ? 1 : 0)
+            }
+            cached = (value, now)
+            return value
+        }
+
+        static func invalidate() {
+            lock.lock()
+            defer { lock.unlock() }
+            cached = nil
+        }
+    }
+}
+
+extension Defaults {
     enum Key: String {
         // MARK: General Settings
         case showIceIcon = "ShowIceIcon"
