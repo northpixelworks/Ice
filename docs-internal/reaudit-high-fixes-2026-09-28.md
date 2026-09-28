@@ -54,7 +54,22 @@ An adversarial review of `66a49f5`, `360125d` and `dfe8023` found no code defect
 - "Stop pointer movement from cancelling pending clicks" (CHANGELOG). This contradicted its own known-gap note. `mouseMovedTap` cancels hover intents only, but it only sees moves with the button released. Moving while the button is held arrives as `leftMouseDragged`, and `mouseDraggedMonitor` still cancels every pending intent. The entry now says a pending click survives plain mouse-move events within four points, and that drags and scrolls still cancel it.
 - Also tightened: "behavior with Screen Recording is unchanged" now reads "with Screen Recording and readable titles". `SmartRehidePolicy.titlesAvailable` also needs another app's titled normal-level window, so a permitted Ice with no such window uses the untitled path. The 2026-09-26 report's manual-acceptance line no longer says unrelated apps never cycle assertions.
 
-Still open, unchanged by this follow-up: the C2 per-call preference read, C5 drag/scroll cancellation, the missing C3/C4/C5 tests, and live verification of both fixes.
+Still open after that follow-up: the C2 per-call preference read, C5 drag/scroll cancellation, the missing C3/C4/C5 tests, and live verification of both fixes. Section 5 closes all but the C4 test and the live checks.
+
+## 5. Second follow-up: remaining code gaps from the Low finding
+
+The Low finding's suggested fix was to close the code gaps, not only to document them. The user's saved settings have show-on-click and show-on-scroll on, so both gaps below affect them directly. Each was re-verified against the code first.
+
+- **C5 drag/scroll cancelled pending clicks.** `mouseDraggedMonitor` and `scrollWheelMonitor` called `cancelModernEmptySpaceAction()` unconditionally. A click intent waits 50 ms plus an Accessibility confirmation (up to 0.4 s), and pressing a button can report a one- or two-point `leftMouseDragged`, which dropped the click. Both monitors now call `EventManager.modernPointerEventOccurred(_:at:)`: any drag or scroll still cancels a hover intent, but a click intent is cancelled only once the pointer is more than four points away (the same tolerance the action checks when it fires). Moving back does not revive a cancelled click. The bookkeeping moved into `startModernIntent(at:isHover:body:)` unchanged, so tests can drive it. Debug log: `[Ice ShowOnClick] pending click kept through drag|scroll jitter` (once per click).
+- **C2 per-call auto-hide read.** `NSScreen.appKitMenuBarFrame` copied the whole global defaults domain on every call; with show-on-scroll that is every scroll event (`handleShowOnScroll` → `isMouseInsideMenuBar`). It now calls `Defaults.MenuBarAutoHide.isEnabled()`, which reuses one read for up to a second. The cache is lock-guarded because the `NSScreen` extension is not main-actor isolated. Debug log: `[Ice MenuBarAutoHide] preference read as 0|1` when the value changes. `appKitMenuBarFrame` still lists on-screen windows (`WindowInfo.menuBarWindow`) per call; that is outside C2's scope and unmeasured.
+- **C3 manager-level tests.** `testSnapshotStartedBeforePlanChangeIsDiscarded`: a snapshot read starts while an app is visible, the app is then assigned to Hidden and the new assertion is confirmed, and the stale reply arrives. It must not release the new assertion, set an error, or schedule a retry. `testVerificationCannotFailInsideSettleWindow`: snapshots that keep showing a concealed item must not fail verification (through the refresh path and the one-second retries) until three seconds after activation, and must fail after that.
+- **C4** is still without a test: `move()` reads the live enumerator and posts real Command-drag events, so testing it safely needs injection first.
+
+**Tests.** `IceTests/MenuBarPointerEventTests.swift` (5 tests) drives `EventManager` through the method both monitors call: jitter drags and scrolls keep a pending click, which still fires; a drag beyond four points or an unknown pointer location cancels it; any drag or scroll cancels a hover. It also calls the real `NSScreen.containsAppKitMenuBarPoint` 100 times and asserts one preference read, and checks re-reads after the maximum age. The standalone script gained one intent check (21 checks).
+
+**Fails without the fix** (all four reverted together, then restored; targeted run): restoring the unconditional cancel, the direct `Defaults.globalDomain` read, the pre-C3 post-await generation/plan capture, and the retry's missing `elapsed >= 3` gate made the corresponding tests fail (details under Verification).
+
+**Known difference.** A scroll that arrives while a click is pending no longer cancels it. With show-on-scroll, if the scroll changes the section first, the click action sees the changed state and does nothing, so there is no double toggle.
 
 ## Verification
 
@@ -80,6 +95,15 @@ Review follow-up (scratch `fix2/fixup-ice/`, same commands):
 - `git diff --check`: clean.
 - Settings safety: this time the exports differ in one key. The test host rewrote `NSWindow Frame PermissionsWindow` from `22 17 550 820 …` to `22 -15 550 852 …`: the test-host copy opened its Permissions window (the known re-audit Low finding that IceTests runs a full Ice against the installed app's settings). No other key changed, and nothing was imported or restored.
 
+Second follow-up (scratch `fix2/fixup-ice/run2/`, same commands):
+
+- Standalone: **21 passed** (20 plus the intent jitter check).
+- IceTests: **94 passed, 0 failed, 0 skipped** (87 plus 5 `MenuBarPointerEventTests` and 2 C3 manager tests). No compiler warnings in the touched files; the remaining warnings are the existing unstructured-throwing-task ones in untouched files.
+- Fails without the fix (targeted `-only-testing` run with all four reverted, then restored): `testDragAndScrollJitterKeepPendingClick` ("Jitter within four points must keep the click"), `testMenuBarFrameReusesOneAutoHidePreferenceRead` (0 reads through the cache instead of 1), `testSnapshotStartedBeforePlanChangeIsDiscarded` (2 invalidations, "macOS did not apply menu bar hiding.", a third activation from the retry), `testVerificationCannotFailInsideSettleWindow` (the one-second retry had already failed verification and released the assertion before the 2.5 s check). The other three pointer tests passed, as expected: two cover cancellation, which the old code also did, and one exercises the cache directly.
+- `git diff --check`: clean.
+- Settings safety: exported before and after. The only difference is again `NSWindow Frame PermissionsWindow` (`22 155 550 682 …` before, `22 17 550 820 …` after), from the test host's Permissions window. The "before" value already differed from the previous run's "after" value, so the installed Ice also rewrites this key. Nothing was imported or restored.
+- Final run on the committed tree: standalone **21 passed**; IceTests **93 passed, 1 skipped, 0 failed**. The skip was the unrelated `ModernMenuBarHealthTests.testRunningSystemAgentHasUsableKernelIdentity`, whose guard found no MenuBarAgent in that test host's running-application list at that moment (MenuBarAgent was running); two targeted reruns passed. Settings exports before and after this run, and after the reruns, were identical.
+
 ## Manual checks still required on the real Mac
 
 1. Install a build with these commits (not done here). With a Hidden assignment active, launch a menu bar app that was not running (for example Dropbox or a VPN client). Its icon should appear within about a second without toggling, and `log stream --predicate 'process == "Ice"' | grep "reapplying allowlist"` should show one line.
@@ -87,3 +111,5 @@ Review follow-up (scratch `fix2/fixup-ice/`, same commands):
 3. Limited mode (no Screen Recording), auto-rehide on, Smart strategy: reveal Hidden items, click into Safari or Finder, and confirm the items rehide after about 250 ms. `[Ice SmartRehide]` lines should show `titlesAvailable=0 … rehide=1`.
 4. Same, clicking the desktop and the Dock (both should rehide), and clicking a Raycast/Spotlight-style panel (see the known difference above).
 5. Optional: grant Screen Recording, relaunch Ice, and confirm `titlesAvailable=1` and unchanged behavior.
+6. Show-on-click: press in empty menu bar space with a slight wobble (or a firm trackpad click) and while a scroll is still coasting. The Hidden section should toggle every time; `[Ice ShowOnClick] pending click kept through drag jitter` appears when a wobble was absorbed. Command-dragging a menu bar item must still not toggle sections.
+7. Show-on-scroll: scroll continuously for about 10 seconds and run `sample Ice 10` meanwhile. `persistentDomain` should appear on the scroll path at most about once per second, not once per event; `[Ice MenuBarAutoHide]` should log only when the auto-hide setting changes.
