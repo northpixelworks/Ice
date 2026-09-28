@@ -5,12 +5,12 @@ Scope: Part C of `../.prd/code-review-fixes-portworth-cockpit-ice.md`. Local Con
 ## Implementation
 
 - C1: every AX attribute read sets a maximum 0.2-second messaging timeout; snapshot reads share a 1.5-second deadline and report partial/read-error snapshots. Debug logs include read count and duration.
-- C2: macOS 27 does not install the legacy auxiliary-cover pointer monitor or 1/5-second timers. `_HIHideMenuBar` is cached and refreshed every 30 seconds.
-- C3: refresh captures visibility generation, applied plan, and suspension epoch before awaiting; stale replies cannot update discovery or invalidate assertions. Verification cannot fail inside the three-second settle window.
-- C4: move completion uses merged discovery and preserves the previous list on empty/unreadable snapshots.
-- C5: pointer movement cancels hover intents only; clicks allow up to four points of jitter and retain the menu-bar geometry checks.
+- C2: macOS 27 does not install the legacy auxiliary-cover pointer monitor or 1/5-second timers. `MenuBarManager` caches `_HIHideMenuBar` and refreshes it every 30 seconds. **Correction (re-audit 2026-09-27):** `NSScreen.appKitMenuBarFrame` (`Ice/Utilities/Extensions.swift:597`) still reads `_HIHideMenuBar` (a full global-domain copy) on every call, which runs per mouse move with show-on-hover and during timed rehide. Not fixed.
+- C3: refresh captures visibility generation, applied plan, and suspension epoch before awaiting; stale replies cannot update discovery or invalidate assertions. Verification cannot fail inside the three-second settle window. **Correction:** the code is in place, but no manager-level test covers the plan-change discard or the `elapsed >= 3` gate; only the pre-existing struct-level lifecycle tests cover generations and the settle window.
+- C4: move completion uses merged discovery and preserves the previous list on empty/unreadable snapshots. **Correction:** no `move()` test exists; only the pre-existing `ModernItemDiscovery.mergedItems` tests cover merging.
+- C5: `mouseMoved` cancels hover intents only, and the intent itself tolerates up to four points of pointer movement. **Correction:** the drag and scroll monitors (`EventManager.swift` `mouseDraggedMonitor`/`scrollWheelMonitor`) still cancel any pending click intent, so a 1-2 point drag while the button is held, or momentum scrolling, still drops show-on-click. Not fixed.
 - C6: MenuBarAgent AX notifications request debounced refreshes, with a 20-second backstop. Sleep and inactive-session suspension are tracked independently. Wake during an in-flight refresh coalesces an immediate follow-up instead of losing it. Stop/suspend cancels verification and removes the AX run-loop source. Stale occupancy replies after suspension are rejected.
-- C7: application launch/termination triggers refresh; assertion reapplication compares allowed bundles owning observed status items, avoiding reactivation for unrelated applications. New-app visibility still needs live verification; observer support and discovery of newly hidden items depend on macOS behavior.
+- C7: application launch/termination triggers refresh. **Correction:** the shipped reapply check compared allowlists only over bundles owning *observed* status items. An app launched while hiding was active was hidden by the assertion, never observed, and so never reapplied: it stayed hidden until an unrelated plan change (re-audit High). Fixed on 2026-09-28, see `reaudit-high-fixes-2026-09-28.md`: the gate now uses the running-application set, and a running-applications observer covers LSUIElement apps, for which NSWorkspace posts no launch notification.
 - C8: hover show/rehide delays share one stored cancellable task.
 - C9: the three-second verification task is owned/cancelled; hide-application-menus is explained as unavailable in the macOS 27 UI and its legacy callback is gated.
 
@@ -32,7 +32,9 @@ Added lifecycle regression tests were run before their fixes and both failed (`/
 - `testWakeDuringSnapshotQueuesImmediateRefresh`
 - `testSessionActivationDoesNotResumeSleepingScreens`
 
-Both pass after the fixes. Existing/expanded tests cover stopped-manager stale replies, stale visibility generations, settle-window behavior, occupancy geometry/jitter, and merged item discovery. Tests synthesize notifications inside the test process; they do not put the Mac to sleep.
+Both pass after the fixes. Tests synthesize notifications inside the test process; they do not put the Mac to sleep.
+
+**Correction (re-audit 2026-09-27):** only the two C6 tests above were shown to fail before their fixes. `testStoppedManagerDiscardsInFlightSnapshot` (C3 stale reply) passed on pre-fix code in the re-audit repro, so it does not prove C3. The stale-generation, settle-window, and merged-discovery tests already existed at `b688916` and exercise only the `ModernVisibilityLifecycle` and `ModernItemDiscovery` structs. Missing until added: a C3 plan-change/manager settle-window test, a C4 `move()` test, and a C5 drag/scroll intent test. The C7 launch test was added on 2026-09-28.
 
 ## Install and runtime verification
 
@@ -55,7 +57,7 @@ A 12-sample `top` capture showed 0.0–2.5% CPU (mean 0.82% across all samples),
 - Sustained pointer movement: measure CPU below 1% and absence of per-move persistent-domain copies. Static samples alone cannot prove this threshold.
 - Real screen sleep/session lock/wake: verify no new AX reads while suspended and prompt resume from logs. Notification regressions cover logic without interrupting the user's Mac.
 - Confirm AX created/destroyed/moved notification support on this OS build and measure actual reads/minute against the previous build; the backstop frequency alone drops from 20 to 3 polls/minute (85%).
-- Launch a newly installed status-item app while hiding is active; verify it stays visible and unrelated applications do not cycle assertions.
+- Launch a newly installed status-item app while hiding is active; verify it becomes visible within a second and unrelated applications do not cycle assertions. The 2026-09-28 fix is covered by a fake-workspace test; live verification is still outstanding.
 - Missing-permission startup, granted-permission hide/show and layout drag, fullscreen/auto-hide, multiple displays, click jitter, and live task-count checks remain manual.
 - C9 ad-hoc helper/team behavior is **unverified on macOS 26**. Host is macOS 27; service security checks were not weakened.
 
