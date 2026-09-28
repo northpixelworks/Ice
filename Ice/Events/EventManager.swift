@@ -20,7 +20,9 @@ final class EventManager: ObservableObject {
 
     private var modernInteractionGeneration: UInt64 = 0
     private var modernEmptySpaceTask: Task<Void, Never>?
+    private var modernIntent: ModernMenuBarInteractionIntent?
     private var modernIntentIsHover = false
+    private var modernIntentSurvivedJitter = false
     private var rehideTask: Task<Void, Never>?
 
     // MARK: Monitors
@@ -59,7 +61,7 @@ final class EventManager: ObservableObject {
         for: .leftMouseDragged
     ) { [weak self] event in
         if let self, let appState, let screen = bestScreen(appState: appState) {
-            cancelModernEmptySpaceAction()
+            modernPointerEventOccurred("drag", at: MouseHelpers.locationCoreGraphics)
             handleLeftMouseDragged(with: event, appState: appState, screen: screen)
         }
         return event
@@ -84,7 +86,7 @@ final class EventManager: ObservableObject {
         for: .scrollWheel
     ) { [weak self] event in
         if let self, let appState, let screen = bestScreen(appState: appState) {
-            cancelModernEmptySpaceAction()
+            modernPointerEventOccurred("scroll", at: MouseHelpers.locationCoreGraphics)
             handleShowOnScroll(with: event, appState: appState, screen: screen)
         }
         return event
@@ -526,6 +528,30 @@ extension EventManager {
         modernInteractionGeneration &+= 1
         modernEmptySpaceTask?.cancel()
         modernEmptySpaceTask = nil
+        modernIntent = nil
+    }
+
+    /// A Boolean value that indicates whether an empty-space action is pending.
+    var hasPendingModernIntent: Bool {
+        modernEmptySpaceTask != nil
+    }
+
+    /// Handles a drag or scroll event. These end a hover intent, but end a
+    /// click intent only once the pointer leaves the jitter tolerance that
+    /// the action itself checks.
+    func modernPointerEventOccurred(_ kind: String, at point: CGPoint?) {
+        if let modernIntent, modernEmptySpaceTask != nil, modernIntent.survivesPointerEvent(
+            at: point,
+            generation: modernInteractionGeneration,
+            isHover: modernIntentIsHover
+        ) {
+            if !modernIntentSurvivedJitter {
+                modernIntentSurvivedJitter = true
+                NSLog("[Ice ShowOnClick] pending click kept through %@ jitter", kind)
+            }
+            return
+        }
+        cancelModernEmptySpaceAction()
     }
 
     /// Check cheap menu bounds before querying the application menu. Status-item
@@ -555,13 +581,7 @@ extension EventManager {
               !isMouseInsideNotch(appState: appState, screen: screen),
               waitsForMenuBar || isModernEmptySpaceCandidate(appState: appState, screen: screen),
               let point = MouseHelpers.locationCoreGraphics else { return }
-        cancelModernEmptySpaceAction()
-        modernIntentIsHover = waitsForMenuBar
-        let intent = ModernMenuBarInteractionIntent(point: point, generation: modernInteractionGeneration)
-        modernEmptySpaceTask = Task { [weak self] in
-            defer {
-                if self?.modernInteractionGeneration == intent.generation { self?.modernEmptySpaceTask = nil }
-            }
+        startModernIntent(at: point, isHover: waitsForMenuBar) { [weak self] intent in
             if delay > 0 {
                 do { try await Task.sleep(for: .seconds(delay)) } catch { return }
             }
@@ -584,6 +604,29 @@ extension EventManager {
                 guard waitsForMenuBar, ProcessInfo.processInfo.systemUptime < deadline else { return }
                 do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
             } while ProcessInfo.processInfo.systemUptime < deadline
+        }
+    }
+
+    /// Replaces any pending empty-space intent with one at `point`, running
+    /// `body` as its task until it finishes or a newer intent replaces it.
+    func startModernIntent(
+        at point: CGPoint,
+        isHover: Bool,
+        body: @escaping @MainActor (ModernMenuBarInteractionIntent) async -> Void
+    ) {
+        cancelModernEmptySpaceAction()
+        modernIntentIsHover = isHover
+        modernIntentSurvivedJitter = false
+        let intent = ModernMenuBarInteractionIntent(point: point, generation: modernInteractionGeneration)
+        modernIntent = intent
+        modernEmptySpaceTask = Task { [weak self] in
+            defer {
+                if self?.modernInteractionGeneration == intent.generation {
+                    self?.modernEmptySpaceTask = nil
+                    self?.modernIntent = nil
+                }
+            }
+            await body(intent)
         }
     }
 

@@ -53,11 +53,21 @@ struct ModernMenuBarOccupancy: Sendable {
 /// A delayed action belongs to the exact pointer position and input generation
 /// that requested it. Moving away and back must not revive an earlier click.
 struct ModernMenuBarInteractionIntent {
+    static let jitterTolerance: CGFloat = 4
+
     let point: CGPoint
     let generation: UInt64
 
     func isCurrent(point: CGPoint?, generation: UInt64) -> Bool {
         guard self.generation == generation, let point else { return false }
-        return hypot(self.point.x - point.x, self.point.y - point.y) <= 4
+        return hypot(self.point.x - point.x, self.point.y - point.y) <= Self.jitterTolerance
+    }
+
+    /// Whether a drag or scroll event leaves this intent pending. Any pointer
+    /// event ends a hover intent. A click intent survives jitter: pressing a
+    /// button can report a one- or two-point drag, and scrolling does not
+    /// move the pointer.
+    func survivesPointerEvent(at point: CGPoint?, generation: UInt64, isHover: Bool) -> Bool {
+        !isHover && isCurrent(point: point, generation: generation)
     }
 }

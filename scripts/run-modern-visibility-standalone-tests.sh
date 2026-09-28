@@ -128,6 +128,17 @@ test("auto-hidden menu bars own only the reveal edge while retracted") {
     check(shown.contains(CGPoint(x: -800, y: 1160)), "notched menu bar uses full visible height")
 }
 
+test("click intents survive drag and scroll jitter; hover intents do not") {
+    let point = CGPoint(x: 900, y: 12)
+    let intent = ModernMenuBarInteractionIntent(point: point, generation: 3)
+    check(intent.survivesPointerEvent(at: CGPoint(x: 902, y: 13), generation: 3, isHover: false), "two-point drag keeps a click")
+    check(intent.survivesPointerEvent(at: CGPoint(x: 900, y: 16), generation: 3, isHover: false), "four points is still jitter")
+    check(!intent.survivesPointerEvent(at: CGPoint(x: 905, y: 12), generation: 3, isHover: false), "five points ends a click")
+    check(!intent.survivesPointerEvent(at: point, generation: 4, isHover: false), "a newer intent replaces the click")
+    check(!intent.survivesPointerEvent(at: nil, generation: 3, isHover: false), "unknown pointer ends a click")
+    check(!intent.survivesPointerEvent(at: point, generation: 3, isHover: true), "any drag or scroll ends a hover")
+}
+
 test("sliding and retracted bars cannot establish assertion success or failure") {
     let display = CGRect(x: -1920, y: -200, width: 1920, height: 1080)
     let bar = CGRect(x: -1920, y: -200, width: 1920, height: 26)
