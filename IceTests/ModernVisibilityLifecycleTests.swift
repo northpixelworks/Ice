@@ -598,3 +598,136 @@ extension ModernVisibilityLifecycleTests {
         XCTAssertEqual(calls, 1, "Session activation cannot override screen sleep")
     }
 }
+
+/// Answers snapshots at once, except one call a test holds open to stand in
+/// for a slow Accessibility read.
+private actor ScriptedSnapshots {
+    private var current: ModernMenuBarSnapshot
+    private var holdsNextCall = false
+    private var held: CheckedContinuation<ModernMenuBarSnapshot, Never>?
+
+    init(_ snapshot: ModernMenuBarSnapshot) {
+        current = snapshot
+    }
+
+    var isHolding: Bool { held != nil }
+
+    func set(_ snapshot: ModernMenuBarSnapshot) {
+        current = snapshot
+    }
+
+    func holdNextCall() {
+        holdsNextCall = true
+    }
+
+    func release(_ snapshot: ModernMenuBarSnapshot) {
+        held?.resume(returning: snapshot)
+        held = nil
+    }
+
+    func snapshot() async -> ModernMenuBarSnapshot {
+        guard holdsNextCall else { return current }
+        holdsNextCall = false
+        return await withCheckedContinuation { held = $0 }
+    }
+}
+
+extension ModernVisibilityLifecycleTests {
+    /// C3: a snapshot that started before a plan change describes the old
+    /// menu bar. Judged against the new plan it would fail the new assertion,
+    /// release it, and schedule a retry (a hide/show flip-flop).
+    @MainActor
+    func testSnapshotStartedBeforePlanChangeIsDiscarded() async throws {
+        let workspace = FakeModernWorkspace(applications: [
+            ModernRunningApplication(bundleID: Constants.bundleIdentifier, canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.hidden", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.other", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+        ])
+        workspace.layout.assignments["example.hidden"] = .hidden
+        let beforeChange = ModernMenuBarSnapshot(
+            items: [item("example.visible"), item("example.other", x: 20), systemAnchor()],
+            isReadable: true
+        )
+        let script = ScriptedSnapshots(beforeChange)
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { await script.snapshot() },
+            environment: workspace.environment
+        )
+        manager.performSetup()
+        defer { manager.stop() }
+
+        let activated = try await waitUntil { workspace.activatedAllowlists.count == 1 }
+        XCTAssertTrue(activated, "Hiding never activated")
+        guard activated else { return }
+        await manager.refresh()
+        XCTAssertEqual(manager.visibilityStatus, "Menu bar hiding is active.")
+
+        // A refresh starts reading the menu bar while example.other is visible.
+        await script.holdNextCall()
+        let stale = Task { await manager.refresh() }
+        for _ in 0..<200 {
+            if await script.isHolding { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let holding = await script.isHolding
+        XCTAssertTrue(holding, "The refresh never started reading the menu bar")
+        guard holding else { return }
+
+        // The plan changes before that read returns, and the new plan is confirmed.
+        manager.assign(item("example.other", x: 20), to: .hidden)
+        XCTAssertEqual(workspace.activatedAllowlists.count, 2)
+        XCTAssertEqual(workspace.invalidations, 1)
+        await script.set(ModernMenuBarSnapshot(items: [item("example.visible"), systemAnchor()], isReadable: true))
+        let confirmed = try await waitUntil(timeout: 4.5) { manager.visibilityStatus == "Menu bar hiding is active." }
+        XCTAssertTrue(confirmed, "The new plan should verify from a current snapshot")
+
+        await script.release(beforeChange)
+        await stale.value
+        XCTAssertEqual(workspace.invalidations, 1, "A stale snapshot must not release the new assertion")
+        XCTAssertNil(manager.errorMessage)
+        XCTAssertEqual(manager.visibilityStatus, "Menu bar hiding is active.")
+
+        // No retry either: the assertion stays as it is.
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertEqual(workspace.activatedAllowlists.count, 2)
+        XCTAssertEqual(workspace.invalidations, 1)
+    }
+
+    /// C3: macOS can take a moment to apply an assertion. Snapshots that still
+    /// show a concealed item keep waiting for three seconds, including the
+    /// one-second verification retries, and only then count as a failure.
+    @MainActor
+    func testVerificationCannotFailInsideSettleWindow() async throws {
+        let workspace = FakeModernWorkspace(applications: [
+            ModernRunningApplication(bundleID: Constants.bundleIdentifier, canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.hidden", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+        ])
+        workspace.layout.assignments["example.hidden"] = .hidden
+        let notYetApplied = ModernMenuBarSnapshot(
+            items: [item("example.visible"), item("example.hidden", x: 20), systemAnchor()],
+            isReadable: true
+        )
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { notYetApplied },
+            environment: workspace.environment
+        )
+        manager.performSetup()
+        defer { manager.stop() }
+
+        let activated = try await waitUntil { workspace.activatedAllowlists.count == 1 }
+        XCTAssertTrue(activated, "Hiding never activated")
+        guard activated else { return }
+        let activatedAt = ProcessInfo.processInfo.systemUptime
+        await manager.refresh()
+
+        try await Task.sleep(for: .seconds(max(0, activatedAt + 2.5 - ProcessInfo.processInfo.systemUptime)))
+        XCTAssertEqual(workspace.invalidations, 0, "Verification failed inside the settle window")
+        XCTAssertEqual(workspace.activatedAllowlists.count, 1)
+
+        let failed = try await waitUntil(timeout: 2) { workspace.invalidations == 1 }
+        XCTAssertTrue(failed, "A concealed item still visible after the settle window fails verification")
+        XCTAssertGreaterThanOrEqual(ProcessInfo.processInfo.systemUptime - activatedAt, 2.9)
+    }
+}
