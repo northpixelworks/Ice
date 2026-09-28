@@ -450,6 +450,63 @@ extension ModernVisibilityLifecycleTests {
         XCTAssertFalse(workspace.activatedAllowlists[3].contains("example.new"))
         XCTAssertEqual(workspace.layout.section(for: "example.new"), .hidden)
     }
+
+    /// Pins the documented limit of "quits and relaunches cause no churn":
+    /// it holds for Visible apps only. Concealed apps are part of the plan, so
+    /// quitting or relaunching one replaces the assertion, and the last one
+    /// quitting releases it.
+    @MainActor
+    func testQuitAndRelaunchReactivateOnlyForConcealedApps() async throws {
+        let workspace = FakeModernWorkspace(applications: [
+            ModernRunningApplication(bundleID: Constants.bundleIdentifier, canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.hidden", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.alwaysHidden", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+        ])
+        workspace.layout.assignments["example.hidden"] = .hidden
+        workspace.layout.assignments["example.alwaysHidden"] = .alwaysHidden
+        let observed = [item("example.visible"), systemAnchor()]
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { ModernMenuBarSnapshot(items: observed, isReadable: true) },
+            environment: workspace.environment
+        )
+        manager.performSetup()
+        defer { manager.stop() }
+
+        let activated = try await waitUntil { workspace.activatedAllowlists.count == 1 }
+        XCTAssertTrue(activated, "Hiding never activated")
+        guard activated else { return }
+
+        // Visible app: quitting and relaunching keep the active assertion.
+        workspace.terminate("example.visible")
+        try await Task.sleep(for: .milliseconds(500))
+        workspace.launch("example.visible")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(workspace.activatedAllowlists.count, 1)
+        XCTAssertEqual(workspace.invalidations, 0)
+
+        // Concealed app: quitting and relaunching change the plan.
+        workspace.terminate("example.hidden")
+        let replacedOnQuit = try await waitUntil(timeout: 1) { workspace.activatedAllowlists.count == 2 }
+        XCTAssertTrue(replacedOnQuit, "Quitting a concealed app replaces the assertion")
+        guard replacedOnQuit else { return }
+        XCTAssertEqual(workspace.invalidations, 1)
+        workspace.launch("example.hidden")
+        let replacedOnRelaunch = try await waitUntil(timeout: 1) { workspace.activatedAllowlists.count == 3 }
+        XCTAssertTrue(replacedOnRelaunch, "Relaunching a concealed app replaces the assertion")
+        guard replacedOnRelaunch else { return }
+        XCTAssertFalse(workspace.activatedAllowlists[2].contains("example.hidden"), "It stays hidden after relaunch")
+        XCTAssertTrue(workspace.activatedAllowlists[2].contains("example.visible"))
+
+        // The last concealed app quitting releases the assertion outright.
+        workspace.terminate("example.alwaysHidden")
+        let replacedAgain = try await waitUntil(timeout: 1) { workspace.activatedAllowlists.count == 4 }
+        XCTAssertTrue(replacedAgain)
+        workspace.terminate("example.hidden")
+        let released = try await waitUntil(timeout: 1) { workspace.invalidations == 4 }
+        XCTAssertTrue(released, "No concealed app left, so the assertion is released")
+        XCTAssertEqual(workspace.activatedAllowlists.count, 4)
+    }
 }
 
 private actor DelayedReviewSnapshot {

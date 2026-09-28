@@ -57,7 +57,7 @@ A 12-sample `top` capture showed 0.0–2.5% CPU (mean 0.82% across all samples),
 - Sustained pointer movement: measure CPU below 1% and absence of per-move persistent-domain copies. Static samples alone cannot prove this threshold.
 - Real screen sleep/session lock/wake: verify no new AX reads while suspended and prompt resume from logs. Notification regressions cover logic without interrupting the user's Mac.
 - Confirm AX created/destroyed/moved notification support on this OS build and measure actual reads/minute against the previous build; the backstop frequency alone drops from 20 to 3 polls/minute (85%).
-- Launch a newly installed status-item app while hiding is active; verify it becomes visible within a second and unrelated applications do not cycle assertions. The 2026-09-28 fix is covered by a fake-workspace test; live verification is still outstanding.
+- Launch a newly installed status-item app while hiding is active; verify it becomes visible within about a second and that quitting or relaunching Visible-section apps does not cycle assertions (Hidden-section apps are part of the plan and do). The 2026-09-28 fix is covered by fake-workspace tests; live verification is still outstanding.
 - Missing-permission startup, granted-permission hide/show and layout drag, fullscreen/auto-hide, multiple displays, click jitter, and live task-count checks remain manual.
 - C9 ad-hoc helper/team behavior is **unverified on macOS 26**. Host is macOS 27; service security checks were not weakened.
 

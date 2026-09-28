@@ -11,14 +11,14 @@ A second, independent gap: the only launch trigger was `NSWorkspace.didLaunchApp
 **Fix.**
 
 - `ModernAllowlistReapply.missingBundles` (in `ModernSystemItem.swift`): reapply when a running bundle that can own a status item (activation policy not `.prohibited`) is allowed by the plan but missing from the active assertion. Terminations never reapply.
-- `ModernAllowlistReapply.candidateBundles`: bundles an assertion allowed earlier stay in later allowlists while their saved section is visible, so quitting and relaunching an app (or an accessory helper such as WebKit processes) does not reactivate the assertion. Reassigning such an app to Hidden removes it at the next assertion.
+- `ModernAllowlistReapply.candidateBundles`: bundles an assertion allowed earlier stay in later allowlists while their saved section is visible, so quitting and relaunching an app in the Visible section (or an accessory helper such as WebKit processes) does not reactivate the assertion. A helper bundle that is not background-only still reapplies once, at its first launch in the session. Reassigning such an app to Hidden removes it at the next assertion. **Correction (review follow-up):** this holds for Visible apps only. Hidden and Always-Hidden apps are part of the plan while their section is concealed, so quitting or relaunching one replaces the assertion, or releases it when nothing else is hidden (pinned by `testQuitAndRelaunchReactivateOnlyForConcealedApps`). Keeping a quit app's bundle allowed assumes MenuBarClientCore matches bundle identifiers whenever a status item appears; that is unverified live (manual check 2).
 - `ModernMenuBarManager` observes the running-application list (debounced 250 ms) and calls `applyVisibility` directly, without waiting for an AX snapshot, then requests a refresh for discovery. Suspended managers ignore it; during a move it defers to the post-move refresh.
 - `ModernMenuBarEnvironment` injects running applications, the layout store, and the assertion API. The live environment is unchanged behavior; tests use a fake so they neither read the saved layout nor create real assertions. The three existing manager tests now use the fake too (previously they could activate a real assertion from the test host if the saved layout had hidden items). Verification and retry snapshots now go through the same snapshot source as refresh.
 - Debug logging: `[Ice ModernMenuBar] reapplying allowlist for N newly running application(s)` (NSLog) plus the bundle list at `info` level with private redaction; the activation line now includes `allowedApps=`.
 
 **Tests.**
 
-- `ModernVisibilityLifecycleTests.testAppLaunchedWhileHidingIsActiveBecomesVisiblePromptly` — manager-level, fake workspace/assertion API: activates hiding, launches an app absent from every snapshot, asserts a new assertion that allows it within 1 s, and the previous assertion released. Then asserts no reactivation for a background-only helper launch, a quit, a relaunch, or a relaunch after a reveal/conceal cycle, and that an app reassigned to Hidden is dropped from the next allowlist.
+- `ModernVisibilityLifecycleTests.testAppLaunchedWhileHidingIsActiveBecomesVisiblePromptly` — manager-level, fake workspace/assertion API: activates hiding, launches an app absent from every snapshot, asserts a new assertion that allows it within 1 s, and the previous assertion released. Then asserts no reactivation for a background-only helper launch, or for a quit, a relaunch, or a relaunch after a reveal/conceal cycle of that Visible app, and that an app reassigned to Hidden is dropped from the next allowlist. The 1 s bound is fake-workspace timing (250 ms debounce, no real launch latency).
 - Pure tests: `testNewStatusItemAppMissingFromSnapshotRequiresReapply`, `testTerminationRelaunchAndBackgroundHelpersDoNotRequireReapply`, `testConcealedLaunchIsLeftToThePlan`, `testPreviouslyAllowedBundlesStayAllowedUntilConcealed`, plus one standalone script check.
 - Fails without the fix: restoring the old intersection gate made the manager test fail at 1.25 s (reapply never happened). Keeping the new gate but removing the running-application observer also failed ("A new status-item app must be allowed without a manual toggle").
 
@@ -45,6 +45,17 @@ A second, independent gap: the only launch trigger was `NSWorkspace.didLaunchApp
 
 Not fixed in this round (still open from the re-audit): the C2 per-call preference read, C5 drag/scroll cancellation, and the missing C3/C4/C5 tests.
 
+## 4. Review follow-up: overstatements in the correction commit
+
+An adversarial review of `66a49f5`, `360125d` and `dfe8023` found no code defects but judged the documentation fix partial: the correction commit added three new overstatements. Each was re-checked against the code and corrected.
+
+- "Quits and relaunches do not reset the assertion" (CHANGELOG, `docs/MACOS_27.md`, section 1 above). True only for Visible-section apps. `ModernMenuBarLayout.visibilityPlan` puts running Hidden/Always-Hidden bundles into the plan, and `applyVisibility` reactivates whenever the plan differs from the applied one. So quitting or relaunching a concealed app replaces the assertion, and it is released when nothing else (no other app, no system control) stays hidden. New test `testQuitAndRelaunchReactivateOnlyForConcealedApps` pins both halves through the manager and the fake workspace. The docs now also state that a background-only-to-accessory switch waits for the 20-second backstop, and that retaining a quit app's bundle assumes MenuBarClientCore matches bundle identifiers dynamically, which is unverified live.
+- "Within about a quarter second" (CHANGELOG). The 250 ms is only the debounce. It starts when `NSWorkspace.runningApplications` changes, which the probe measured about 0.4 s after launch. The CHANGELOG now says roughly a second and marks the live timing as unmeasured.
+- "Stop pointer movement from cancelling pending clicks" (CHANGELOG). This contradicted its own known-gap note. `mouseMovedTap` cancels hover intents only, but it only sees moves with the button released. Moving while the button is held arrives as `leftMouseDragged`, and `mouseDraggedMonitor` still cancels every pending intent. The entry now says a pending click survives plain mouse-move events within four points, and that drags and scrolls still cancel it.
+- Also tightened: "behavior with Screen Recording is unchanged" now reads "with Screen Recording and readable titles". `SmartRehidePolicy.titlesAvailable` also needs another app's titled normal-level window, so a permitted Ice with no such window uses the untitled path. The 2026-09-26 report's manual-acceptance line no longer says unrelated apps never cycle assertions.
+
+Still open, unchanged by this follow-up: the C2 per-call preference read, C5 drag/scroll cancellation, the missing C3/C4/C5 tests, and live verification of both fixes.
+
 ## Verification
 
 Host: macOS 27.0 (26A428). Scratch paths are under the session scratchpad (`fix2/impl-ice/`).
@@ -62,10 +73,17 @@ git diff --check
 - `git diff --check`: clean.
 - Settings safety: the xcodebuild test host shares `com.jordanbaird.Ice`. The domain was exported before the first run and after the final run; the exports are identical. No import or restore was done.
 
+Review follow-up (scratch `fix2/fixup-ice/`, same commands):
+
+- Standalone: **20 passed**.
+- IceTests: **87 passed, 0 failed, 0 skipped** (86 plus `testQuitAndRelaunchReactivateOnlyForConcealedApps`).
+- `git diff --check`: clean.
+- Settings safety: this time the exports differ in one key. The test host rewrote `NSWindow Frame PermissionsWindow` from `22 17 550 820 …` to `22 -15 550 852 …`: the test-host copy opened its Permissions window (the known re-audit Low finding that IceTests runs a full Ice against the installed app's settings). No other key changed, and nothing was imported or restored.
+
 ## Manual checks still required on the real Mac
 
 1. Install a build with these commits (not done here). With a Hidden assignment active, launch a menu bar app that was not running (for example Dropbox or a VPN client). Its icon should appear within about a second without toggling, and `log stream --predicate 'process == "Ice"' | grep "reapplying allowlist"` should show one line.
-2. Open and close Safari tabs and quit/relaunch that app: no further "reapplying allowlist" lines and no menu bar reflow.
+2. Open and close Safari tabs and quit/relaunch that app: at most one "reapplying allowlist" line per helper bundle's first launch, none for the relaunch, no menu bar reflow, and the relaunched app's icon must come back. A missing icon would mean MenuBarClientCore binds the allowlist to the processes running at activation, and relaunches would then need a reapply. Quitting or relaunching a Hidden app while Hidden is concealed is expected to replace the assertion (one activation line, no "reapplying allowlist" line).
 3. Limited mode (no Screen Recording), auto-rehide on, Smart strategy: reveal Hidden items, click into Safari or Finder, and confirm the items rehide after about 250 ms. `[Ice SmartRehide]` lines should show `titlesAvailable=0 … rehide=1`.
 4. Same, clicking the desktop and the Dock (both should rehide), and clicking a Raycast/Spotlight-style panel (see the known difference above).
 5. Optional: grant Screen Recording, relaunch Ice, and confirm `titlesAvailable=1` and unchanged behavior.
