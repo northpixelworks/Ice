@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import Ice
 
@@ -283,6 +284,174 @@ final class ModernVisibilityLifecycleTests: XCTestCase {
     }
 }
 
+/// Stands in for NSWorkspace, saved defaults, and the private assertion API,
+/// so manager tests never read the user's layout or hide real menu bar items.
+private final class FakeModernWorkspace {
+    var applications: [ModernRunningApplication]
+    var layout = ModernMenuBarLayout()
+    private(set) var activatedAllowlists: [Set<String>] = []
+    private(set) var invalidations = 0
+    private let changes = PassthroughSubject<Void, Never>()
+
+    init(applications: [ModernRunningApplication] = []) {
+        self.applications = applications
+    }
+
+    func launch(_ bundleID: String, canOwnStatusItem: Bool = true) {
+        applications.append(ModernRunningApplication(bundleID: bundleID, canOwnStatusItem: canOwnStatusItem))
+        changes.send()
+    }
+
+    func terminate(_ bundleID: String) {
+        applications.removeAll { $0.bundleID == bundleID }
+        changes.send()
+    }
+
+    var environment: ModernMenuBarEnvironment {
+        ModernMenuBarEnvironment(
+            canHide: true,
+            loadLayout: { [self] in layout },
+            saveLayout: { [self] in layout = $0 },
+            runningApplications: { [self] in applications },
+            runningApplicationsChanged: changes.eraseToAnyPublisher(),
+            makeConfiguration: { _, bundles in Set(bundles) as NSSet },
+            activateAssertion: { [self] configuration, _ in
+                activatedAllowlists.append(configuration as? Set<String> ?? [])
+                return NSObject()
+            },
+            invalidateAssertion: { [self] assertion in
+                if assertion != nil { invalidations += 1 }
+            },
+            startsWatchdog: false
+        )
+    }
+}
+
+@MainActor
+private func waitUntil(timeout: TimeInterval = 2, _ condition: () -> Bool) async throws -> Bool {
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    while !condition() {
+        guard ProcessInfo.processInfo.systemUptime < deadline else { return false }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    return true
+}
+
+extension ModernVisibilityLifecycleTests {
+    func testNewStatusItemAppMissingFromSnapshotRequiresReapply() {
+        let running = [
+            ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.new", canOwnStatusItem: true),
+        ]
+        // example.new is hidden by the assertion, so no snapshot contains it.
+        XCTAssertEqual(
+            ModernAllowlistReapply.missingBundles(
+                allowed: ["example.visible", "example.new", "ice"],
+                applied: ["example.visible", "ice"],
+                running: running
+            ),
+            ["example.new"]
+        )
+    }
+
+    func testTerminationRelaunchAndBackgroundHelpersDoNotRequireReapply() {
+        let applied: Set<String> = ["example.visible", "example.relaunched", "example.quit", "ice"]
+        let running = [
+            ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.relaunched", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.helper", canOwnStatusItem: false),
+        ]
+        let allowed = applied.subtracting(["example.quit"]).union(["example.helper"])
+        XCTAssertEqual(
+            ModernAllowlistReapply.missingBundles(allowed: allowed, applied: applied, running: running),
+            []
+        )
+    }
+
+    func testConcealedLaunchIsLeftToThePlan() {
+        let running = [ModernRunningApplication(bundleID: "example.hidden", canOwnStatusItem: true)]
+        XCTAssertEqual(
+            ModernAllowlistReapply.missingBundles(allowed: ["ice"], applied: ["ice"], running: running),
+            []
+        )
+    }
+
+    func testPreviouslyAllowedBundlesStayAllowedUntilConcealed() {
+        XCTAssertEqual(
+            ModernAllowlistReapply.candidateBundles(
+                running: ["example.running"],
+                previouslyAllowed: ["example.quit", "example.reassigned"],
+                concealedAssignments: ["example.reassigned"]
+            ),
+            ["example.running", "example.quit"]
+        )
+    }
+
+    /// Regression: with the allowlist compared only over observed items, an
+    /// app launched after activation stayed hidden until an unrelated change.
+    @MainActor
+    func testAppLaunchedWhileHidingIsActiveBecomesVisiblePromptly() async throws {
+        let workspace = FakeModernWorkspace(applications: [
+            ModernRunningApplication(bundleID: Constants.bundleIdentifier, canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.hidden", canOwnStatusItem: true),
+            ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+        ])
+        workspace.layout.assignments["example.hidden"] = .hidden
+        let observed = [item("example.visible"), systemAnchor()]
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { ModernMenuBarSnapshot(items: observed, isReadable: true) },
+            environment: workspace.environment
+        )
+        manager.performSetup()
+        defer { manager.stop() }
+
+        let activated = try await waitUntil { workspace.activatedAllowlists.count == 1 }
+        XCTAssertTrue(activated, "Hiding never activated")
+        guard activated else { return }
+        XCTAssertFalse(workspace.activatedAllowlists[0].contains("example.hidden"))
+        XCTAssertFalse(workspace.activatedAllowlists[0].contains("example.new"))
+
+        let launchedAt = ProcessInfo.processInfo.systemUptime
+        workspace.launch("example.new")
+        let reapplied = try await waitUntil(timeout: 1) { workspace.activatedAllowlists.count == 2 }
+        XCTAssertTrue(reapplied, "A new status-item app must be allowed without a manual toggle")
+        guard reapplied else { return }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - launchedAt, 1)
+        XCTAssertTrue(workspace.activatedAllowlists[1].contains("example.new"))
+        XCTAssertFalse(workspace.activatedAllowlists[1].contains("example.hidden"))
+        XCTAssertEqual(workspace.invalidations, 1, "The previous assertion is released after its replacement")
+
+        // Background helpers, quitting, and relaunching cause no churn.
+        workspace.launch("example.helper", canOwnStatusItem: false)
+        try await Task.sleep(for: .milliseconds(500))
+        workspace.terminate("example.new")
+        try await Task.sleep(for: .milliseconds(500))
+        workspace.launch("example.new")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(workspace.activatedAllowlists.count, 2)
+        XCTAssertEqual(workspace.invalidations, 1)
+
+        // A reveal/conceal cycle while the app is not running keeps it allowed.
+        workspace.terminate("example.new")
+        manager.reveal(.hidden)
+        manager.conceal(.hidden)
+        XCTAssertEqual(workspace.activatedAllowlists.count, 3)
+        XCTAssertTrue(workspace.activatedAllowlists[2].contains("example.new"))
+        workspace.launch("example.new")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(workspace.activatedAllowlists.count, 3)
+
+        // A retained app reassigned to Hidden is dropped at the next assertion.
+        workspace.terminate("example.new")
+        manager.assign(item("example.new"), to: .hidden)
+        manager.reveal(.hidden)
+        manager.conceal(.hidden)
+        XCTAssertEqual(workspace.activatedAllowlists.count, 4)
+        XCTAssertFalse(workspace.activatedAllowlists[3].contains("example.new"))
+        XCTAssertEqual(workspace.layout.section(for: "example.new"), .hidden)
+    }
+}
+
 private actor DelayedReviewSnapshot {
     var started = false
     var calls = 0
@@ -303,7 +472,10 @@ extension ModernVisibilityLifecycleTests {
     @MainActor
     func testStoppedManagerDiscardsInFlightSnapshot() async throws {
         let gate = DelayedReviewSnapshot()
-        let manager = ModernMenuBarManager(snapshotOverride: { await gate.snapshot() })
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { await gate.snapshot() },
+            environment: FakeModernWorkspace().environment
+        )
         let refresh = Task { await manager.refresh() }
         for _ in 0..<100 {
             if await gate.started { break }
@@ -323,7 +495,10 @@ extension ModernVisibilityLifecycleTests {
     @MainActor
     func testWakeDuringSnapshotQueuesImmediateRefresh() async throws {
         let gate = DelayedReviewSnapshot()
-        let manager = ModernMenuBarManager(snapshotOverride: { await gate.snapshot() })
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { await gate.snapshot() },
+            environment: FakeModernWorkspace().environment
+        )
         manager.performSetup()
         defer { manager.stop() }
         for _ in 0..<100 {
@@ -344,7 +519,10 @@ extension ModernVisibilityLifecycleTests {
     @MainActor
     func testSessionActivationDoesNotResumeSleepingScreens() async throws {
         let gate = DelayedReviewSnapshot()
-        let manager = ModernMenuBarManager(snapshotOverride: { await gate.snapshot() })
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { await gate.snapshot() },
+            environment: FakeModernWorkspace().environment
+        )
         manager.performSetup()
         defer { manager.stop() }
         for _ in 0..<100 {

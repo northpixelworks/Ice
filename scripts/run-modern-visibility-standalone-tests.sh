@@ -84,6 +84,31 @@ test("hidden input menu cannot be allowed through its host bundle") {
     check(plan.allowedBundles(runningBundles: running, ownBundle: "ice").contains("com.apple.TextInputMenuAgent"), "revealing restores host")
 }
 
+test("newly launched status-item apps require reapply without being observed") {
+    let running = [
+        ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+        ModernRunningApplication(bundleID: "example.new", canOwnStatusItem: true),
+        ModernRunningApplication(bundleID: "example.helper", canOwnStatusItem: false),
+    ]
+    let applied: Set<String> = ["example.visible", "example.quit", "ice"]
+    let allowed: Set<String> = ["example.visible", "example.new", "example.helper", "ice"]
+    checkEqual(
+        ModernAllowlistReapply.missingBundles(allowed: allowed, applied: applied, running: running),
+        ["example.new"],
+        "only the new status-capable app forces a new assertion"
+    )
+    checkEqual(
+        ModernAllowlistReapply.missingBundles(allowed: applied, applied: applied, running: []),
+        [],
+        "terminations never force a new assertion"
+    )
+    checkEqual(
+        ModernAllowlistReapply.candidateBundles(running: ["example.new"], previouslyAllowed: ["example.quit", "example.hidden"], concealedAssignments: ["example.hidden"]),
+        ["example.new", "example.quit"],
+        "previously allowed visible apps stay allowed; reassigned ones do not"
+    )
+}
+
 test("Itsycal dates retain one identity while other apps keep distinct items") {
     let old = item("com.mowglii.ItsycalApp", title: "Itsycal, 23")
     let current = item("com.mowglii.ItsycalApp", title: "Itsycal, 24")

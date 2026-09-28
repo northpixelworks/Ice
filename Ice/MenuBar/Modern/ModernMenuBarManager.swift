@@ -7,6 +7,51 @@ import Cocoa
 import Combine
 import OSLog
 
+/// System services the macOS 27 backend reads and drives. Tests substitute
+/// fakes so they never read saved assignments or create real assertions.
+struct ModernMenuBarEnvironment {
+    var canHide: Bool
+    var loadLayout: () -> ModernMenuBarLayout
+    var saveLayout: (ModernMenuBarLayout) -> Void
+    var runningApplications: () -> [ModernRunningApplication]
+    /// NSWorkspace posts no launch or termination notification for LSUIElement
+    /// apps, which most status-item apps are. Observing the running set does.
+    var runningApplicationsChanged: AnyPublisher<Void, Never>
+    var makeConfiguration: (_ allowedSystemItems: [NSNumber], _ allowedBundles: [String]) -> AnyObject?
+    var activateAssertion: (_ configuration: AnyObject, _ completion: @escaping (Error?) -> Void) -> AnyObject?
+    var invalidateAssertion: (AnyObject?) -> Void
+    var startsWatchdog: Bool
+
+    static var live: Self {
+        Self(
+            canHide: iceModern_assessmentModeAvailable(),
+            loadLayout: {
+                Defaults.data(forKey: .modernMenuBarLayout)
+                    .flatMap { try? JSONDecoder().decode(ModernMenuBarLayout.self, from: $0) } ?? .init()
+            },
+            saveLayout: { layout in
+                if let data = try? JSONEncoder().encode(layout) {
+                    Defaults.set(data, forKey: .modernMenuBarLayout)
+                }
+            },
+            runningApplications: {
+                NSWorkspace.shared.runningApplications.compactMap { app in
+                    app.bundleIdentifier.map {
+                        ModernRunningApplication(bundleID: $0, canOwnStatusItem: app.activationPolicy != .prohibited)
+                    }
+                }
+            },
+            runningApplicationsChanged: NSWorkspace.shared.publisher(for: \.runningApplications, options: [.new])
+                .map { _ in () }
+                .eraseToAnyPublisher(),
+            makeConfiguration: { iceModern_makeConfiguration($0, $1) as AnyObject? },
+            activateAssertion: { iceModern_activateAssertion($0, $1) as AnyObject? },
+            invalidateAssertion: { iceModern_invalidateAssertion($0) },
+            startsWatchdog: true
+        )
+    }
+}
+
 /// The macOS 27 status-item backend. AppState owns it alongside the legacy managers.
 @MainActor
 final class ModernMenuBarManager: ObservableObject {
@@ -20,7 +65,8 @@ final class ModernMenuBarManager: ObservableObject {
     @Published private(set) var visibilityStatus = "Menu bar hiding is idle."
     @Published private(set) var isEditing = false
 
-    let canHide = iceModern_assessmentModeAvailable()
+    let canHide: Bool
+    private let environment: ModernMenuBarEnvironment
     private let enumerator = ModernItemEnumerator()
     private let snapshotOverride: (@Sendable () async -> ModernMenuBarSnapshot)?
     private var refreshTask: Task<Void, Never>?
@@ -38,6 +84,8 @@ final class ModernMenuBarManager: ObservableObject {
     private var assertion: AnyObject?
     private var appliedVisibility = ModernVisibilityPlan()
     private var appliedAllowedBundles = Set<String>()
+    /// Every bundle any assertion allowed since setup; see `candidateBundles`.
+    private var retainedAllowedBundles = Set<String>()
     private var visibilityFailure: ModernVisibilityFailure?
     private let visibilityRetryPolicy = ModernVisibilityRetryPolicy()
     private var visibilityRetryTask: Task<Void, Never>?
@@ -50,15 +98,19 @@ final class ModernMenuBarManager: ObservableObject {
         return !self.isSuspended && !self.isEditing && !self.isMoving
     }
 
-    init(snapshotOverride: (@Sendable () async -> ModernMenuBarSnapshot)? = nil) {
+    init(
+        snapshotOverride: (@Sendable () async -> ModernMenuBarSnapshot)? = nil,
+        environment: ModernMenuBarEnvironment = .live
+    ) {
         self.snapshotOverride = snapshotOverride
-        layout = Defaults.data(forKey: .modernMenuBarLayout)
-            .flatMap { try? JSONDecoder().decode(ModernMenuBarLayout.self, from: $0) } ?? .init()
+        self.environment = environment
+        canHide = environment.canHide
+        layout = environment.loadLayout()
     }
 
     func performSetup() {
         guard timer == nil else { return }
-        watchdog.start()
+        if environment.startsWatchdog { watchdog.start() }
         isSuspended = !suspensionReasons.isEmpty
         NotificationCenter.default.publisher(for: Self.axChanged)
             .debounce(for: .milliseconds(150), scheduler: DispatchQueue.main)
@@ -98,6 +150,25 @@ final class ModernMenuBarManager: ObservableObject {
                 self?.requestRefresh()
             }.store(in: &workspaceObservers)
         }
+        // A short debounce folds a burst of launches into one reactivation
+        // while keeping a new app's items hidden for well under a second.
+        environment.runningApplicationsChanged
+            .receive(on: DispatchQueue.main)
+            .debounce(for: .milliseconds(250), scheduler: DispatchQueue.main)
+            .sink { [weak self] in self?.runningApplicationsDidChange() }
+            .store(in: &workspaceObservers)
+        requestRefresh()
+    }
+
+    /// Allows newly launched status-item apps without an AX snapshot. Hidden
+    /// items never appear in a snapshot, so waiting for one cannot work.
+    private func runningApplicationsDidChange() {
+        guard !isSuspended else { return }
+        guard !isMoving else {
+            refreshPending = true
+            return
+        }
+        guard applyVisibility() else { return }
         requestRefresh()
     }
 
@@ -123,9 +194,7 @@ final class ModernMenuBarManager: ObservableObject {
         let generation = visibilityLifecycle.generation
         let plan = appliedVisibility
         let epoch = refreshEpoch
-        let snapshot: ModernMenuBarSnapshot
-        if let snapshotOverride { snapshot = await snapshotOverride() }
-        else { snapshot = await enumerator.snapshot() }
+        let snapshot = await takeSnapshot()
         guard !Task.isCancelled, !isSuspended, epoch == refreshEpoch,
               generation == visibilityLifecycle.generation, plan == appliedVisibility else { return }
         if snapshot.isReadable, !snapshot.items.isEmpty {
@@ -145,6 +214,12 @@ final class ModernMenuBarManager: ObservableObject {
             checkActiveVisibility(snapshot, plan: appliedVisibility)
         }
         applyVisibility()
+    }
+
+    /// Refresh, verification, and retry all read through the same source.
+    private func takeSnapshot() async -> ModernMenuBarSnapshot {
+        if let snapshotOverride { return await snapshotOverride() }
+        return await enumerator.snapshot()
     }
 
     private func updateKnownItems(from snapshot: ModernMenuBarSnapshot) {
@@ -233,9 +308,7 @@ final class ModernMenuBarManager: ObservableObject {
         errorMessage = nil
         layout.assignments[item.id.assignmentKey] = section
         visibilityFailure = nil
-        if let data = try? JSONEncoder().encode(layout) {
-            Defaults.set(data, forKey: .modernMenuBarLayout)
-        }
+        environment.saveLayout(layout)
         applyVisibility()
     }
 
@@ -248,7 +321,7 @@ final class ModernMenuBarManager: ObservableObject {
     }
 
     func visibilityReality(for section: ModernMenuBarLayout.Section) -> (requested: Int, stillVisible: Int, concealed: Int) {
-        let runningBundles = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+        let runningBundles = Set(environment.runningApplications().map(\.bundleID))
         let requestedPlan = layout.visibilityPlan(
             revealing: isEditing ? Set(ModernMenuBarLayout.Section.allCases) : revealed,
             runningBundles: runningBundles,
@@ -259,26 +332,48 @@ final class ModernMenuBarManager: ObservableObject {
         return (requested.count, stillVisible.count, max(0, requested.count - stillVisible.count))
     }
 
-    private func applyVisibility(forceRetry: Bool = false) {
-        let runningBundles = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+    /// Returns true when the assertion was replaced or released.
+    @discardableResult
+    private func applyVisibility(forceRetry: Bool = false) -> Bool {
+        let running = environment.runningApplications()
+        let runningBundles = Set(running.map(\.bundleID))
+        let revealing = isEditing ? Set(ModernMenuBarLayout.Section.allCases) : revealed
         let effective = layout.visibilityPlan(
-            revealing: isEditing ? Set(ModernMenuBarLayout.Section.allCases) : revealed,
+            revealing: revealing,
             runningBundles: runningBundles,
             ownBundle: Constants.bundleIdentifier
         )
-        let allowed = effective.allowedBundles(runningBundles: runningBundles, ownBundle: Constants.bundleIdentifier)
+        let allowed = effective.allowedBundles(
+            runningBundles: ModernAllowlistReapply.candidateBundles(
+                running: runningBundles,
+                previouslyAllowed: retainedAllowedBundles,
+                concealedAssignments: layout.concealedBundles(revealing: revealing)
+            ),
+            ownBundle: Constants.bundleIdentifier
+        )
         if let failure = visibilityFailure, failure.plan == effective, !forceRetry {
             visibilityStatus = failure.canRetryAutomatically
                 ? "Menu bar hiding is waiting to retry."
                 : "Menu bar hiding needs a retry."
-            return
+            return false
         }
+        // Compare against running applications, never observed items: the
+        // assertion hides an unlisted app, so its item never gets observed.
+        let missingBundles = ModernAllowlistReapply.missingBundles(
+            allowed: allowed,
+            applied: appliedAllowedBundles,
+            running: running
+        )
         if !forceRetry,
            effective == appliedVisibility,
-           !effective.requiresAssertion || allowed.intersection(Set(items.map { $0.id.bundleID })) == appliedAllowedBundles.intersection(Set(items.map { $0.id.bundleID })),
+           !effective.requiresAssertion || missingBundles.isEmpty,
            assertion != nil || !effective.requiresAssertion {
             updateVisibilityStatus(for: effective)
-            return
+            return false
+        }
+        if effective == appliedVisibility, assertion != nil, !missingBundles.isEmpty {
+            NSLog("[Ice ModernMenuBar] reapplying allowlist for %ld newly running application(s)", missingBundles.count)
+            diagnosticLogger.info("Allowlist adds \(missingBundles.sorted().joined(separator: ","), privacy: .private)")
         }
         visibilityLifecycle.markIdle()
         verificationTask?.cancel()
@@ -286,28 +381,28 @@ final class ModernMenuBarManager: ObservableObject {
         let previousAssertion = assertion
         awaitingVisibility = false
         guard effective.requiresAssertion else {
-            iceModern_invalidateAssertion(previousAssertion)
+            environment.invalidateAssertion(previousAssertion)
             assertion = nil
             appliedVisibility = ModernVisibilityPlan()
             appliedAllowedBundles = []
             visibilityFailure = nil
             updateVisibilityStatus(for: effective)
-            return
+            return true
         }
         guard canHide else {
             errorMessage = "Menu bar hiding is unavailable on this macOS build."
             visibilityStatus = "Menu bar hiding is unavailable on this macOS build."
-            return
+            return false
         }
-        // Include every running bundle, not only AX-visible apps. This keeps
-        // unrelated and newly discovered applications visible.
-        guard let config = iceModern_makeConfiguration(effective.allowedSystemItems.map { NSNumber(value: $0.rawValue) }, Array(allowed)) else {
+        // Include every running bundle, not only AX-visible apps, plus visible
+        // bundles allowed earlier. Anything unlisted is hidden by macOS.
+        guard let config = environment.makeConfiguration(effective.allowedSystemItems.map { NSNumber(value: $0.rawValue) }, Array(allowed)) else {
             recordVisibilityFailure(effective, message: "macOS could not prepare menu bar hiding.")
-            return
+            return false
         }
         let activationGeneration = visibilityLifecycle.beginActivation()
-        NSLog("[Ice ModernMenuBar] activation generation=%ld hiddenApps=%ld hiddenSystemItems=%ld", activationGeneration, effective.bundles.count, effective.systemItems.count)
-        guard let newAssertion = iceModern_activateAssertion(config, { [weak self] error in
+        NSLog("[Ice ModernMenuBar] activation generation=%ld hiddenApps=%ld hiddenSystemItems=%ld allowedApps=%ld", activationGeneration, effective.bundles.count, effective.systemItems.count, allowed.count)
+        guard let newAssertion = environment.activateAssertion(config, { [weak self] error in
             Task { @MainActor in
                 guard let self, self.visibilityLifecycle.handleCallback(generation: activationGeneration) else { return }
                 if let error {
@@ -315,19 +410,20 @@ final class ModernMenuBarManager: ObservableObject {
                     self.errorMessage = "macOS reported a hiding issue; Ice is verifying the menu bar."
                 }
             }
-        }) as AnyObject? else {
+        }) else {
             visibilityLifecycle.markFailed(message: "Menu bar hiding is unavailable on this macOS build.")
             recordVisibilityFailure(effective, message: "Menu bar hiding is unavailable on this macOS build.")
-            return
+            return false
         }
         assertion = newAssertion
         appliedVisibility = effective
         appliedAllowedBundles = allowed
+        retainedAllowedBundles.formUnion(allowed)
         awaitingVisibility = true
         visibilityActivatedAt = ProcessInfo.processInfo.systemUptime
         visibilityStatus = "Waiting for macOS to confirm menu bar hiding..."
         if let previousAssertion {
-            iceModern_invalidateAssertion(previousAssertion)
+            environment.invalidateAssertion(previousAssertion)
         }
         verificationTask?.cancel()
         verificationTask = Task { [weak self] in
@@ -338,12 +434,13 @@ final class ModernMenuBarManager: ObservableObject {
             }
             guard !Task.isCancelled else { return }
             guard let self else { return }
-            let snapshot = await self.enumerator.snapshot()
+            let snapshot = await self.takeSnapshot()
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self.finishVisibilityVerification(snapshot, generation: activationGeneration, plan: effective)
             }
         }
+        return true
     }
 
     private func finishVisibilityVerification(
@@ -382,7 +479,7 @@ final class ModernMenuBarManager: ObservableObject {
             errorMessage = "Ice could not read a complete macOS menu bar snapshot to confirm hiding."
         case .failed(let message):
             awaitingVisibility = false
-            iceModern_invalidateAssertion(assertion)
+            environment.invalidateAssertion(assertion)
             assertion = nil
             appliedVisibility = ModernVisibilityPlan()
             appliedAllowedBundles = []
@@ -404,7 +501,7 @@ final class ModernMenuBarManager: ObservableObject {
         case .keepWaiting, .activeButUnverified, .ignoredStale:
             return
         case .failed(let message):
-            iceModern_invalidateAssertion(assertion)
+            environment.invalidateAssertion(assertion)
             assertion = nil
             appliedVisibility = ModernVisibilityPlan()
             appliedAllowedBundles = []
@@ -422,7 +519,7 @@ final class ModernMenuBarManager: ObservableObject {
             }
             guard !Task.isCancelled else { return }
             guard let self else { return }
-            let snapshot = await self.enumerator.snapshot()
+            let snapshot = await self.takeSnapshot()
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self.finishVisibilityVerification(snapshot, generation: generation, plan: plan)
@@ -517,10 +614,11 @@ final class ModernMenuBarManager: ObservableObject {
         visibilityRetryTask?.cancel()
         visibilityRetryTask = nil
         visibilityLifecycle.markIdle()
-        iceModern_invalidateAssertion(assertion)
+        environment.invalidateAssertion(assertion)
         assertion = nil
         appliedVisibility = ModernVisibilityPlan()
         appliedAllowedBundles = []
+        retainedAllowedBundles = []
         awaitingVisibility = false
         updateVisibilityStatus(for: ModernVisibilityPlan())
     }
