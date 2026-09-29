@@ -121,7 +121,7 @@ final class ModernMenuBarManager: ObservableObject {
         let center = NSWorkspace.shared.notificationCenter
         let suspensionNotifications = [
             (NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification),
-            (NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification)
+            (NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification),
         ]
         for (suspend, resume) in suspensionNotifications {
             center.publisher(for: suspend).receive(on: DispatchQueue.main).sink { [weak self] _ in
