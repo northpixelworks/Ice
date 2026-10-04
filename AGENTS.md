@@ -3,7 +3,7 @@
 <!-- BEGIN:cross-agent-agent-rules -->
 ## Cross-Agent Compatibility
 
-This repository is prepared for both Codex and Claude Code. Keep durable project instructions here in `AGENTS.md`; Claude loads `CLAUDE.md`, which should import this file with `@AGENTS.md`.
+This repository is prepared for both Codex and Claude Code. `AGENTS.md` is the single instruction file for every agent; keep durable project instructions here.
 
 ### Start Here
 - [README.md](README.md) — README.
