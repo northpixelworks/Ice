@@ -89,19 +89,23 @@ struct AdvancedSettingsPane: View {
 
     @ViewBuilder
     private var hideApplicationMenus: some View {
-        Toggle(
-            "Hide app menus when showing menu bar items",
-            isOn: $settings.hideApplicationMenus
-        )
-        .annotation {
-            Text(
-                """
-                Make more room in the menu bar by hiding the current app menus if \
-                needed. macOS requires Ice to make itself visible in the Dock while \
-                this setting is in effect.
-                """
+        if #available(macOS 27, *) {
+            Text("Hiding app menus is unavailable on macOS 27.").foregroundStyle(.secondary)
+        } else {
+            Toggle(
+                "Hide app menus when showing menu bar items",
+                isOn: $settings.hideApplicationMenus
             )
-            .padding(.trailing, 75)
+            .annotation {
+                Text(
+                    """
+                    Make more room in the menu bar by hiding the current app menus if \
+                    needed. macOS requires Ice to make itself visible in the Dock while \
+                    this setting is in effect.
+                    """
+                )
+                .padding(.trailing, 75)
+            }
         }
     }
 

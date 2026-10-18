@@ -105,16 +105,9 @@ struct PermissionsView: View {
     @ViewBuilder
     private var continueButton: some View {
         Button {
-            appState.dismissWindow(.permissions)
-
-            guard manager.permissionsState != .missing else {
-                appState.performSetup(hasPermissions: false)
-                return
-            }
-
-            appState.performSetup(hasPermissions: true)
-
             Task {
+                guard await appState.retryPermissionSetup() else { return }
+                appState.dismissWindow(.permissions)
                 appState.activate(withPolicy: .regular)
                 appState.openWindow(.settings)
             }
@@ -165,6 +158,24 @@ struct PermissionsView: View {
                     }
                 }
                 .allowsHitTesting(!permission.hasPermission)
+
+                if permission is AccessibilityPermission, !permission.hasPermission {
+                    Text(MenuBarAccessDiagnostic.repairGuidance(appPath: Bundle.main.bundlePath))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    HStack {
+                        Button("Open Accessibility Settings") { permission.openSettings() }
+                        Button("Retry Access") {
+                            Task {
+                                guard await appState.retryPermissionSetup() else { return }
+                                appState.dismissWindow(.permissions)
+                                appState.activate(withPolicy: .regular)
+                                appState.openWindow(.settings)
+                            }
+                        }
+                    }
+                }
 
                 if !permission.isRequired {
                     CalloutBox("Ice can work in a limited mode without this permission.") {

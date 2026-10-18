@@ -88,7 +88,7 @@ final class MenuBarManager: ObservableObject {
 
     /// A Boolean value that indicates whether the system menu bar is configured to auto-hide.
     private var isMenuBarConfiguredToAutoHide: Bool {
-        Defaults.globalDomain["_HIHideMenuBar"] as? Bool ?? isMenuBarHiddenBySystemUserDefaults
+        isMenuBarHiddenBySystemUserDefaults
     }
 
     /// A visual mode for an auxiliary status item cover panel.
@@ -158,23 +158,27 @@ final class MenuBarManager: ObservableObject {
                 .store(in: &c)
         }
 
-        EventMonitor.publish(events: [.mouseMoved, .leftMouseDragged, .rightMouseDragged], scope: .universal)
-            .receive(on: DispatchQueue.main)
+        isMenuBarHiddenBySystemUserDefaults = Defaults.globalDomain["_HIHideMenuBar"] as? Bool ?? false
+        Timer.publish(every: 30, on: .main, in: .default).autoconnect()
             .sink { [weak self] _ in
-                self?.updateAuxiliaryStatusItemCoversForPointerChange()
-            }
-            .store(in: &c)
-
-        Timer.publish(every: 1, on: .main, in: .default)
-            .autoconnect()
-            .sink { [weak self] _ in
-                guard let self else { return }
-                if let isMenuBarHidden = Defaults.globalDomain["_HIHideMenuBar"] as? Bool {
-                    isMenuBarHiddenBySystemUserDefaults = isMenuBarHidden
+                self?.isMenuBarHiddenBySystemUserDefaults = Defaults.globalDomain["_HIHideMenuBar"] as? Bool ?? false
+            }.store(in: &c)
+        if #unavailable(macOS 27) {
+            EventMonitor.publish(events: [.mouseMoved, .leftMouseDragged, .rightMouseDragged], scope: .universal)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.updateAuxiliaryStatusItemCoversForPointerChange()
                 }
-                updateAuxiliaryStatusItemCovers(refreshImages: true)
-            }
-            .store(in: &c)
+                .store(in: &c)
+
+            Timer.publish(every: 1, on: .main, in: .default)
+                .autoconnect()
+                .sink { [weak self] _ in
+                    guard let self else { return }
+                    updateAuxiliaryStatusItemCovers(refreshImages: true)
+                }
+                .store(in: &c)
+        }
 
         // Handle the `focusedApp` rehide strategy.
         NSWorkspace.shared.publisher(for: \.frontmostApplication)
@@ -202,20 +206,23 @@ final class MenuBarManager: ObservableObject {
             }
             .store(in: &c)
 
-        $settingsWindow
-            .removeNil()
-            .flatMap { $0.publisher(for: \.isVisible) }
-            .discardMerge(Timer.publish(every: 5, on: .main, in: .default).autoconnect())
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                self?.updateAverageColorInfo()
-            }
-            .store(in: &c)
+        if #unavailable(macOS 27) {
+            $settingsWindow
+                .removeNil()
+                .flatMap { $0.publisher(for: \.isVisible) }
+                .discardMerge(Timer.publish(every: 5, on: .main, in: .default).autoconnect())
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] in
+                    self?.updateAverageColorInfo()
+                }
+                .store(in: &c)
+        }
 
         // Hide application menus when a section is shown (if applicable).
         Publishers.MergeMany(sections.map { $0.controlItem.$state })
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
+                if #available(macOS 27, *) { return }
                 guard let self, let appState else {
                     return
                 }
@@ -342,6 +349,7 @@ final class MenuBarManager: ObservableObject {
 
     /// Updates cover panels after pointer movement, without refreshing images unless visibility changes.
     private func updateAuxiliaryStatusItemCoversForPointerChange() {
+        if #available(macOS 27, *) { return }
         guard let appState else {
             closeAuxiliaryStatusItemCoverPanels()
             return

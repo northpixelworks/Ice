@@ -125,7 +125,9 @@ final class ModernMenuBarOccupancyTests: XCTestCase {
         let point = CGPoint(x: 900, y: 13)
         let intent = ModernMenuBarInteractionIntent(point: point, generation: 10)
         XCTAssertTrue(intent.isCurrent(point: point, generation: 10))
-        XCTAssertFalse(intent.isCurrent(point: CGPoint(x: 901, y: 13), generation: 10))
+        XCTAssertTrue(intent.isCurrent(point: CGPoint(x: 901, y: 13), generation: 10))
+        XCTAssertTrue(intent.isCurrent(point: CGPoint(x: 904, y: 13), generation: 10))
+        XCTAssertFalse(intent.isCurrent(point: CGPoint(x: 905, y: 13), generation: 10))
         XCTAssertFalse(intent.isCurrent(point: point, generation: 11))
         XCTAssertFalse(intent.isCurrent(point: nil, generation: 10))
     }

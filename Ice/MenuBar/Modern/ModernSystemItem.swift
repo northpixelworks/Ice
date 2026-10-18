@@ -122,3 +122,40 @@ struct ModernVisibilityPlan: Equatable {
         return bundles.contains(id.bundleID)
     }
 }
+
+/// A running process as the assertion allowlist sees it.
+struct ModernRunningApplication: Equatable {
+    var bundleID: String
+    /// Background-only (`.prohibited`) processes cannot show status items.
+    var canOwnStatusItem: Bool
+}
+
+/// Decides when a newly running application requires a new assertion.
+///
+/// Bundles missing from the allowlist are hidden while an assertion is
+/// active, and hidden items never reach MenuBarAgent's Accessibility tree.
+/// Observed items therefore cannot drive this decision; the running set can.
+enum ModernAllowlistReapply {
+    /// Bundles that may own a status item, are allowed by the current plan,
+    /// and are missing from the active assertion. Terminations and
+    /// background-only helpers never require reapplying.
+    static func missingBundles(
+        allowed: Set<String>,
+        applied: Set<String>,
+        running: [ModernRunningApplication]
+    ) -> Set<String> {
+        Set(running.filter(\.canOwnStatusItem).map(\.bundleID))
+            .intersection(allowed)
+            .subtracting(applied)
+    }
+
+    /// Bundles allowed earlier stay allowed while their saved section is
+    /// visible, so quitting and relaunching one needs no new assertion.
+    static func candidateBundles(
+        running: Set<String>,
+        previouslyAllowed: Set<String>,
+        concealedAssignments: Set<String>
+    ) -> Set<String> {
+        running.union(previouslyAllowed.subtracting(concealedAssignments))
+    }
+}

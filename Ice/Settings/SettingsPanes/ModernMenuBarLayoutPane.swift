@@ -11,6 +11,7 @@ struct ModernMenuBarLayoutPane: View {
     @EnvironmentObject var appState: AppState
     @ObservedObject var manager: ModernMenuBarManager
     @State private var search = ""
+    @State private var hasAccessibilityPermission = AXHelpers.isProcessTrusted()
 
     var body: some View {
         ScrollView {
@@ -39,22 +40,59 @@ struct ModernMenuBarLayoutPane: View {
                 if manager.isMoving {
                     ProgressView("Moving item in the menu bar…")
                 }
-                if manager.items.isEmpty {
-                    Text(manager.isRefreshing ? "Reading menu bar items…" : "No items could be read. Make sure Ice has Accessibility permission and the menu bar is visible, then refresh.")
-                        .foregroundStyle(.secondary)
-                }
+                accessDiagnostic
                 ForEach(ModernMenuBarLayout.Section.allCases, id: \.self) { section in
                     sectionView(section)
                 }
-                Button("Refresh Items") { Task { await manager.refresh() } }
+                Button("Retry Access and Refresh") {
+                    Task {
+                        guard await appState.retryPermissionSetup() else { return }
+                        await manager.refresh()
+                    }
+                }
                     .disabled(manager.isRefreshing || manager.isMoving)
             }
             .padding(20)
         }
-        .onAppear { manager.beginEditing() }
+        .onAppear {
+            appState.permissions.recheckPermissions()
+            manager.beginEditing()
+        }
+        .onReceive(appState.permissions.accessibility.$hasPermission) { granted in
+            hasAccessibilityPermission = granted
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            appState.permissions.recheckPermissions()
+        }
         .onDisappear { manager.endEditing() }
         .onReceive(appState.navigationState.$isSettingsPresented) { visible in
             if visible { manager.beginEditing() } else { manager.endEditing() }
+        }
+    }
+
+    @ViewBuilder
+    private var accessDiagnostic: some View {
+        switch MenuBarAccessDiagnostic.select(
+            isTrusted: hasAccessibilityPermission,
+            hasItems: !manager.items.isEmpty,
+            isRefreshing: manager.isRefreshing
+        ) {
+        case .accessibilityDenied:
+            VStack(alignment: .leading, spacing: 8) {
+                Text(MenuBarAccessDiagnostic.repairGuidance(appPath: Bundle.main.bundlePath))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Button("Open Accessibility Settings") {
+                    appState.permissions.accessibility.openSettings()
+                }
+            }
+        case .reading:
+            Text("Reading menu bar items…").foregroundStyle(.secondary)
+        case .noItems:
+            Text("Accessibility access is granted, but no menu bar items could be read. Make sure the menu bar is visible, then retry.")
+                .foregroundStyle(.secondary)
+        case nil:
+            EmptyView()
         }
     }
 

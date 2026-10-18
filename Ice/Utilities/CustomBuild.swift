@@ -12,7 +12,7 @@ enum CustomBuild {
         Bundle.main.object(forInfoDictionaryKey: "IceCustomBuild") as? Bool ?? false
     }
 
-    static let updatesURL = URL(string: "https://github.com/mariowabnig/Ice/commits/main")!
+    static let updatesURL = URL(string: "https://github.com/northpixelworks/Ice/commits/main")!
 
     static var description: String {
         Bundle.main.object(forInfoDictionaryKey: "IceCustomBuildDescription") as? String

@@ -122,6 +122,14 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// A settings window can be reopened before permission-gated setup has run.
+    /// Retrying access must complete that setup before asking managers to refresh.
+    func retryPermissionSetup() async -> Bool {
+        guard permissions.recheckPermissions() else { return false }
+        await setupTask.value
+        return true
+    }
+
     /// Configures the internal observers for the app state.
     private func configureCancellables() {
         var c = Set<AnyCancellable>()

@@ -84,6 +84,31 @@ test("hidden input menu cannot be allowed through its host bundle") {
     check(plan.allowedBundles(runningBundles: running, ownBundle: "ice").contains("com.apple.TextInputMenuAgent"), "revealing restores host")
 }
 
+test("newly launched status-item apps require reapply without being observed") {
+    let running = [
+        ModernRunningApplication(bundleID: "example.visible", canOwnStatusItem: true),
+        ModernRunningApplication(bundleID: "example.new", canOwnStatusItem: true),
+        ModernRunningApplication(bundleID: "example.helper", canOwnStatusItem: false),
+    ]
+    let applied: Set<String> = ["example.visible", "example.quit", "ice"]
+    let allowed: Set<String> = ["example.visible", "example.new", "example.helper", "ice"]
+    checkEqual(
+        ModernAllowlistReapply.missingBundles(allowed: allowed, applied: applied, running: running),
+        ["example.new"],
+        "only the new status-capable app forces a new assertion"
+    )
+    checkEqual(
+        ModernAllowlistReapply.missingBundles(allowed: applied, applied: applied, running: []),
+        [],
+        "terminations never force a new assertion"
+    )
+    checkEqual(
+        ModernAllowlistReapply.candidateBundles(running: ["example.new"], previouslyAllowed: ["example.quit", "example.hidden"], concealedAssignments: ["example.hidden"]),
+        ["example.new", "example.quit"],
+        "previously allowed visible apps stay allowed; reassigned ones do not"
+    )
+}
+
 test("Itsycal dates retain one identity while other apps keep distinct items") {
     let old = item("com.mowglii.ItsycalApp", title: "Itsycal, 23")
     let current = item("com.mowglii.ItsycalApp", title: "Itsycal, 24")
@@ -101,6 +126,17 @@ test("auto-hidden menu bars own only the reveal edge while retracted") {
     check(hidden.contains(CGPoint(x: -800, y: 1181.5)), "reveal edge remains reachable")
     let shown = ModernMenuBarGeometry.interactionFrame(screen: screen, height: 38, isRetracted: false)
     check(shown.contains(CGPoint(x: -800, y: 1160)), "notched menu bar uses full visible height")
+}
+
+test("click intents survive drag and scroll jitter; hover intents do not") {
+    let point = CGPoint(x: 900, y: 12)
+    let intent = ModernMenuBarInteractionIntent(point: point, generation: 3)
+    check(intent.survivesPointerEvent(at: CGPoint(x: 902, y: 13), generation: 3, isHover: false), "two-point drag keeps a click")
+    check(intent.survivesPointerEvent(at: CGPoint(x: 900, y: 16), generation: 3, isHover: false), "four points is still jitter")
+    check(!intent.survivesPointerEvent(at: CGPoint(x: 905, y: 12), generation: 3, isHover: false), "five points ends a click")
+    check(!intent.survivesPointerEvent(at: point, generation: 4, isHover: false), "a newer intent replaces the click")
+    check(!intent.survivesPointerEvent(at: nil, generation: 3, isHover: false), "unknown pointer ends a click")
+    check(!intent.survivesPointerEvent(at: point, generation: 3, isHover: true), "any drag or scroll ends a hover")
 }
 
 test("sliding and retracted bars cannot establish assertion success or failure") {

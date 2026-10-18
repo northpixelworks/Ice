@@ -20,6 +20,10 @@ final class EventManager: ObservableObject {
 
     private var modernInteractionGeneration: UInt64 = 0
     private var modernEmptySpaceTask: Task<Void, Never>?
+    private var modernIntent: ModernMenuBarInteractionIntent?
+    private var modernIntentIsHover = false
+    private var modernIntentSurvivedJitter = false
+    private var rehideTask: Task<Void, Never>?
 
     // MARK: Monitors
 
@@ -57,7 +61,7 @@ final class EventManager: ObservableObject {
         for: .leftMouseDragged
     ) { [weak self] event in
         if let self, let appState, let screen = bestScreen(appState: appState) {
-            cancelModernEmptySpaceAction()
+            modernPointerEventOccurred("drag", at: MouseHelpers.locationCoreGraphics)
             handleLeftMouseDragged(with: event, appState: appState, screen: screen)
         }
         return event
@@ -71,7 +75,7 @@ final class EventManager: ObservableObject {
         option: .listenOnly
     ) { [weak self] _, event in
         if let self, let appState, let screen = bestScreen(appState: appState) {
-            cancelModernEmptySpaceAction()
+            if modernIntentIsHover { cancelModernEmptySpaceAction() }
             handleShowOnHover(appState: appState, screen: screen)
         }
         return event
@@ -82,7 +86,7 @@ final class EventManager: ObservableObject {
         for: .scrollWheel
     ) { [weak self] event in
         if let self, let appState, let screen = bestScreen(appState: appState) {
-            cancelModernEmptySpaceAction()
+            modernPointerEventOccurred("scroll", at: MouseHelpers.locationCoreGraphics)
             handleShowOnScroll(with: event, appState: appState, screen: screen)
         }
         return event
@@ -147,6 +151,8 @@ final class EventManager: ObservableObject {
 
     /// Stops all monitors.
     func stopAll() {
+        rehideTask?.cancel()
+        rehideTask = nil
         cancelModernEmptySpaceAction()
         for monitor in allMonitors {
             monitor.stop()
@@ -274,27 +280,42 @@ extension EventManager {
                 return
             }
 
-            // Get the window that the user has clicked into.
-            guard
-                let mouseLocation = MouseHelpers.locationCoreGraphics,
-                let windowUnderMouse = WindowInfo.createWindows(option: .onScreen)
-                    .filter({ $0.layer < CGWindowLevelForKey(.cursorWindow) })
-                    .first(where: { $0.bounds.contains(mouseLocation) && $0.title?.isEmpty == false }),
-                let owningApplication = windowUnderMouse.owningApplication
-            else {
+            // Get the window that the user has clicked into. Titles need Screen
+            // Recording, so limited mode falls back to owner and layer data.
+            guard let mouseLocation = MouseHelpers.locationCoreGraphics else {
+                return
+            }
+            let windows = WindowInfo.createWindows(option: .onScreen).map(SmartRehidePolicy.Window.init)
+            let titlesAvailable = SmartRehidePolicy.titlesAvailable(
+                permissionGranted: ScreenCapture.checkPermissions(),
+                windows: windows,
+                ownPID: ProcessInfo.processInfo.processIdentifier
+            )
+            guard let target = SmartRehidePolicy.clickedWindow(
+                in: windows,
+                at: mouseLocation,
+                titlesAvailable: titlesAvailable,
+                maximumLayer: Int(CGWindowLevelForKey(.cursorWindow)),
+                owner: SmartRehidePolicy.Owner.init(pid:)
+            ) else {
+                NSLog("[Ice SmartRehide] no clicked window found titlesAvailable=%d windows=%ld", titlesAvailable ? 1 : 0, windows.count)
                 return
             }
 
-            // The dock is an exception to the following check.
-            if owningApplication.bundleIdentifier != "com.apple.dock" {
-                // Only continue if the user has clicked into an active window with
-                // a regular activation policy.
-                guard
-                    owningApplication.isActive,
-                    owningApplication.activationPolicy == .regular
-                else {
-                    return
-                }
+            // Only continue if the user has clicked into an active window with a
+            // regular activation policy. The Dock is an exception.
+            let shouldRehide = SmartRehidePolicy.shouldRehide(owner: target.owner)
+            NSLog(
+                "[Ice SmartRehide] titlesAvailable=%d layer=%ld policy=%ld active=%d dock=%d rehide=%d",
+                titlesAvailable ? 1 : 0,
+                target.window.layer,
+                target.owner.activationPolicy.rawValue,
+                target.owner.isActive ? 1 : 0,
+                target.owner.bundleIdentifier == SmartRehidePolicy.dockBundleIdentifier ? 1 : 0,
+                shouldRehide ? 1 : 0
+            )
+            guard shouldRehide else {
+                return
             }
 
             // All checks have passed, so hide the sections.
@@ -405,6 +426,9 @@ extension EventManager {
     // MARK: Handle Show On Hover
 
     private func handleShowOnHover(appState: AppState, screen: NSScreen) {
+        rehideTask?.cancel()
+        rehideTask = nil
+        if modernEmptySpaceTask != nil && !modernIntentIsHover { return }
         // Make sure the "ShowOnHover" feature is enabled and allowed.
         guard
             appState.settings.general.showOnHover,
@@ -433,8 +457,9 @@ extension EventManager {
             guard isMouseInsideEmptyMenuBarSpace(appState: appState, screen: screen) else {
                 return
             }
-            Task {
-                try await Task.sleep(for: .seconds(delay))
+            rehideTask = Task {
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+                guard !Task.isCancelled else { return }
                 // Make sure the feature is still enabled and the mouse is still inside.
                 guard
                     appState.settings.general.showOnHover,
@@ -451,8 +476,9 @@ extension EventManager {
             else {
                 return
             }
-            Task {
-                try await Task.sleep(for: .seconds(delay))
+            rehideTask = Task {
+                do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+                guard !Task.isCancelled else { return }
                 // Make sure the feature is still enabled and the mouse is still outside.
                 guard
                     appState.settings.general.showOnHover,
@@ -502,6 +528,30 @@ extension EventManager {
         modernInteractionGeneration &+= 1
         modernEmptySpaceTask?.cancel()
         modernEmptySpaceTask = nil
+        modernIntent = nil
+    }
+
+    /// A Boolean value that indicates whether an empty-space action is pending.
+    var hasPendingModernIntent: Bool {
+        modernEmptySpaceTask != nil
+    }
+
+    /// Handles a drag or scroll event. These end a hover intent, but end a
+    /// click intent only once the pointer leaves the jitter tolerance that
+    /// the action itself checks.
+    func modernPointerEventOccurred(_ kind: String, at point: CGPoint?) {
+        if let modernIntent, modernEmptySpaceTask != nil, modernIntent.survivesPointerEvent(
+            at: point,
+            generation: modernInteractionGeneration,
+            isHover: modernIntentIsHover
+        ) {
+            if !modernIntentSurvivedJitter {
+                modernIntentSurvivedJitter = true
+                NSLog("[Ice ShowOnClick] pending click kept through %@ jitter", kind)
+            }
+            return
+        }
+        cancelModernEmptySpaceAction()
     }
 
     /// Check cheap menu bounds before querying the application menu. Status-item
@@ -531,9 +581,7 @@ extension EventManager {
               !isMouseInsideNotch(appState: appState, screen: screen),
               waitsForMenuBar || isModernEmptySpaceCandidate(appState: appState, screen: screen),
               let point = MouseHelpers.locationCoreGraphics else { return }
-        cancelModernEmptySpaceAction()
-        let intent = ModernMenuBarInteractionIntent(point: point, generation: modernInteractionGeneration)
-        modernEmptySpaceTask = Task { [weak self] in
+        startModernIntent(at: point, isHover: waitsForMenuBar) { [weak self] intent in
             if delay > 0 {
                 do { try await Task.sleep(for: .seconds(delay)) } catch { return }
             }
@@ -556,6 +604,29 @@ extension EventManager {
                 guard waitsForMenuBar, ProcessInfo.processInfo.systemUptime < deadline else { return }
                 do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
             } while ProcessInfo.processInfo.systemUptime < deadline
+        }
+    }
+
+    /// Replaces any pending empty-space intent with one at `point`, running
+    /// `body` as its task until it finishes or a newer intent replaces it.
+    func startModernIntent(
+        at point: CGPoint,
+        isHover: Bool,
+        body: @escaping @MainActor (ModernMenuBarInteractionIntent) async -> Void
+    ) {
+        cancelModernEmptySpaceAction()
+        modernIntentIsHover = isHover
+        modernIntentSurvivedJitter = false
+        let intent = ModernMenuBarInteractionIntent(point: point, generation: modernInteractionGeneration)
+        modernIntent = intent
+        modernEmptySpaceTask = Task { [weak self] in
+            defer {
+                if self?.modernInteractionGeneration == intent.generation {
+                    self?.modernEmptySpaceTask = nil
+                    self?.modernIntent = nil
+                }
+            }
+            await body(intent)
         }
     }
 

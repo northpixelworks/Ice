@@ -71,6 +71,8 @@ public actor ModernItemEnumerator {
     private var agentElement: AXUIElement?
     private var agentPID: pid_t = 0
     private var snapshotHadReadErrors = false
+    private var snapshotDeadline: TimeInterval = .infinity
+    private var snapshotReadCount = 0
 
     /// Correlates each observed item group to a stable agent tag. Tags come
     /// from the positions plist domain (`status:<bundle>::<title>`); we build
@@ -81,6 +83,13 @@ public actor ModernItemEnumerator {
 
     public func snapshot() -> ModernMenuBarSnapshot {
         snapshotHadReadErrors = false
+        let started = ProcessInfo.processInfo.systemUptime
+        snapshotReadCount = 0
+        snapshotDeadline = started + 1.5
+        defer {
+            NSLog("[Ice ModernAX] snapshot reads=%ld duration=%.3f incomplete=%d", snapshotReadCount, ProcessInfo.processInfo.systemUptime - started, snapshotHadReadErrors)
+            snapshotDeadline = .infinity
+        }
         guard let agent = resolveAgent() else { return .unreadable }
         guard let windows = copyAttribute(agent, kAXChildrenAttribute) as? [AXUIElement] else {
             return .unreadable
@@ -444,6 +453,13 @@ public actor ModernItemEnumerator {
     }
 
     private func copyAttribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+        let remaining = snapshotDeadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0, !Task.isCancelled else {
+            snapshotHadReadErrors = true
+            return nil
+        }
+        snapshotReadCount += 1
+        AXUIElementSetMessagingTimeout(element, Float(min(0.2, remaining)))
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
         if Self.isIncompleteRead(error) {

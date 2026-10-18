@@ -69,6 +69,17 @@ final class AppPermissions: ObservableObject {
         }
     }
 
+    /// Explicit retries must work even after setup has stopped periodic checks.
+    @discardableResult
+    func recheckPermissions() -> Bool {
+        for permission in allPermissions {
+            permission.refresh()
+        }
+        updatePermissionsState()
+        logger.info("Accessibility recheck: \(self.accessibility.hasPermission ? "granted" : "denied", privacy: .public)")
+        return permissionsState != .missing
+    }
+
     /// Stops running all permissions checks.
     func stopAllChecks() {
         logger.info("Stopping all permissions checks")

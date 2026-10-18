@@ -75,22 +75,34 @@ class Permission: ObservableObject, Identifiable {
                 guard let self else {
                     return
                 }
-                // @Published fires on every assignment. Assign only on change,
-                // or AppState republishes and every open settings view redraws
-                // once per second, even while the window sits on another Space.
-                let granted = check()
-                if hasPermission != granted {
-                    hasPermission = granted
-                }
+                refresh()
             }
+    }
+
+    /// Rechecks the running process instead of relying on the Settings switch or a cached result.
+    @discardableResult
+    func refresh() -> Bool {
+        // @Published fires on every assignment. Assign only on change, or
+        // AppState republishes and every open settings view redraws once per
+        // second, even while the window sits on another Space.
+        let granted = check()
+        if hasPermission != granted {
+            hasPermission = granted
+        }
+        return granted
+    }
+
+    /// Opens the relevant Settings pane without requesting or changing permissions.
+    func openSettings() {
+        if let settingsURL {
+            NSWorkspace.shared.open(settingsURL)
+        }
     }
 
     /// Performs the request and opens the System Settings app to the appropriate pane.
     func performRequest() {
         request()
-        if let settingsURL {
-            NSWorkspace.shared.open(settingsURL)
-        }
+        openSettings()
     }
 
     /// Asynchronously waits for the app to be granted this permission.
@@ -133,7 +145,7 @@ final class AccessibilityPermission: Permission {
                 "Arrange menu bar items.",
             ],
             isRequired: true,
-            settingsURL: nil,
+            settingsURL: URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"),
             check: {
                 AXHelpers.isProcessTrusted()
             },
