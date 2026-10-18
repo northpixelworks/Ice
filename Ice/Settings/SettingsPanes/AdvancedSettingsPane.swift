@@ -43,6 +43,9 @@ struct AdvancedSettingsPane: View {
                 showOnHoverDelay
                 tempShowInterval
             }
+            IceSection("Diagnostics") {
+                detailedMenuBarLogging
+            }
             IceSection("Permissions") {
                 allPermissions
             }
@@ -118,6 +121,14 @@ struct AdvancedSettingsPane: View {
             )
             .padding(.trailing, 75)
         }
+    }
+
+    @ViewBuilder
+    private var detailedMenuBarLogging: some View {
+        Toggle("Detailed menu bar logging", isOn: $settings.detailedMenuBarLogging)
+            .annotation(
+                "Log every menu bar hiding step to Console. Turn on only while troubleshooting. Errors are always logged."
+            )
     }
 
     @ViewBuilder

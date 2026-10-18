@@ -5,6 +5,9 @@ All notable changes to Ice are tracked here retroactively from the available git
 ## Unreleased
 
 ### macOS 27 compatibility
+- Show newly launched apps' menu bar items immediately: re-apply the macOS allowlist on app launch and quit instead of waiting up to one refresh cycle plus an Accessibility snapshot.
+- Stop once-per-second SMAppService status logging: permissions publish only real changes, and the Launch at login toggle caches its status (refreshed when the pane appears or the window becomes key). The Settings window stays alive on other Spaces, so every redraw used to log.
+- Add Advanced > Diagnostics > Detailed menu bar logging (off by default) for routine hiding activation and verification logs; failures are always logged.
 - Recover automatically from sustained MenuBarAgent hangs, using repeated Accessibility timeouts plus resource pressure, active-session guards, exact process identity checks, and a persisted 30-minute restart cooldown. Preserve saved layout assignments and keep local recovery diagnostics.
 - Remove the Input Menu host from the app allowlist when Input Menu is hidden. Previously its system assignment conflicted with the host exemption, causing verification failures, all hidden icons to return, and repeated menu bar reflow.
 - Keep Itsycal’s identity stable across daily date changes to prevent duplicate layout entries and stale drag targets.

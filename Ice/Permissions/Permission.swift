@@ -75,7 +75,13 @@ class Permission: ObservableObject, Identifiable {
                 guard let self else {
                     return
                 }
-                hasPermission = check()
+                // @Published fires on every assignment. Assign only on change,
+                // or AppState republishes and every open settings view redraws
+                // once per second, even while the window sits on another Space.
+                let granted = check()
+                if hasPermission != granted {
+                    hasPermission = granted
+                }
             }
     }
 

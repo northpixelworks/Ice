@@ -70,7 +70,7 @@ struct GeneralSettingsPane: View {
 
     @ViewBuilder
     private var appOptions: some View {
-        LaunchAtLogin.Toggle()
+        LaunchAtLoginToggle()
     }
 
     // MARK: Ice Icon Options
@@ -355,6 +355,47 @@ struct GeneralSettingsPane: View {
                 alert.runModal()
             }
             isApplyingItemSpacingOffset = false
+        }
+    }
+}
+
+// MARK: - LaunchAtLoginToggle
+
+/// Caches the login item status. `LaunchAtLogin.Toggle` reads
+/// `SMAppService.mainApp.status` on every redraw, and macOS logs each read.
+@MainActor
+private final class LaunchAtLoginStatus: ObservableObject {
+    static let shared = LaunchAtLoginStatus()
+
+    @Published private(set) var isEnabled = LaunchAtLogin.isEnabled
+
+    func refresh() {
+        let current = LaunchAtLogin.isEnabled
+        if isEnabled != current {
+            isEnabled = current
+        }
+    }
+
+    func set(_ enabled: Bool) {
+        LaunchAtLogin.isEnabled = enabled
+        refresh()
+    }
+}
+
+private struct LaunchAtLoginToggle: View {
+    @ObservedObject private var status = LaunchAtLoginStatus.shared
+
+    var body: some View {
+        Toggle(
+            "Launch at login",
+            isOn: Binding(get: { status.isEnabled }, set: { status.set($0) })
+        )
+        .onAppear {
+            status.refresh()
+        }
+        // Catch changes made in System Settings while the window was away.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            status.refresh()
         }
     }
 }

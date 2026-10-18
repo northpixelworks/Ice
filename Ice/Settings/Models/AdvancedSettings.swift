@@ -39,6 +39,10 @@ final class AdvancedSettings: ObservableObject {
     /// Time interval to temporarily show items for.
     @Published var tempShowInterval: TimeInterval = 15
 
+    /// A Boolean value that indicates whether to log every menu bar
+    /// hiding step. Off by default; failures are always logged.
+    @Published var detailedMenuBarLogging = false
+
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
 
@@ -64,6 +68,7 @@ final class AdvancedSettings: ObservableObject {
         }
         Defaults.ifPresent(key: .showOnHoverDelay, assign: &showOnHoverDelay)
         Defaults.ifPresent(key: .tempShowInterval, assign: &tempShowInterval)
+        Defaults.ifPresent(key: .detailedMenuBarLogging, assign: &detailedMenuBarLogging)
 
         Defaults.ifPresent(key: .sectionDividerStyle) { rawValue in
             if let style = SectionDividerStyle(rawValue: rawValue) {
@@ -127,6 +132,13 @@ final class AdvancedSettings: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { interval in
                 Defaults.set(interval, forKey: .tempShowInterval)
+            }
+            .store(in: &c)
+
+        $detailedMenuBarLogging
+            .receive(on: DispatchQueue.main)
+            .sink { enabled in
+                Defaults.set(enabled, forKey: .detailedMenuBarLogging)
             }
             .store(in: &c)
 

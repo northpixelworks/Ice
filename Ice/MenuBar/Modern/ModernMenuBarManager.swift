@@ -24,6 +24,7 @@ final class ModernMenuBarManager: ObservableObject {
     private let enumerator = ModernItemEnumerator()
     private let occupancyEnumerator = ModernItemEnumerator()
     private var timer: AnyCancellable?
+    private var appLaunchObserver: AnyCancellable?
     private var assertion: AnyObject?
     private var appliedVisibility = ModernVisibilityPlan()
     private var appliedAllowedBundles = Set<String>()
@@ -48,7 +49,21 @@ final class ModernMenuBarManager: ObservableObject {
         watchdog.start()
         timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
             .sink { [weak self] _ in Task { await self?.refresh() } }
+        // macOS takes an allowlist, so an app launched after the last
+        // activation stays hidden until Ice re-applies. Re-apply on launch
+        // instead of waiting for the next refresh and its menu bar snapshot.
+        let center = NSWorkspace.shared.notificationCenter
+        appLaunchObserver = center.publisher(for: NSWorkspace.didLaunchApplicationNotification)
+            .merge(with: center.publisher(for: NSWorkspace.didTerminateApplicationNotification))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.applyVisibility() }
         Task { await refresh() }
+    }
+
+    /// Routine hiding steps are logged only when the user turns on
+    /// Advanced > Detailed menu bar logging. Failures are always logged.
+    private var logsDetails: Bool {
+        Defaults.bool(forKey: .detailedMenuBarLogging)
     }
 
     func refresh() async {
@@ -228,7 +243,9 @@ final class ModernMenuBarManager: ObservableObject {
             return
         }
         let activationGeneration = visibilityLifecycle.beginActivation()
-        NSLog("[Ice ModernMenuBar] activation generation=%ld hiddenApps=%ld hiddenSystemItems=%ld", activationGeneration, effective.bundles.count, effective.systemItems.count)
+        if logsDetails {
+            NSLog("[Ice ModernMenuBar] activation generation=%ld hiddenApps=%ld hiddenSystemItems=%ld", activationGeneration, effective.bundles.count, effective.systemItems.count)
+        }
         guard let newAssertion = iceModern_activateAssertion(config, { [weak self] error in
             Task { @MainActor in
                 guard let self, self.visibilityLifecycle.handleCallback(generation: activationGeneration) else { return }
@@ -279,13 +296,17 @@ final class ModernMenuBarManager: ObservableObject {
             return
         }
         let result = ModernVisibilityVerifier.verify(plan, in: snapshot)
-        diagnosticLogger.info("Verification generation=\(generation) result=\(String(describing: result), privacy: .private)")
-        for item in snapshot.verificationItems where plan.conceals(item.id) {
-            diagnosticLogger.info("Remaining item \(item.id.bundleID, privacy: .private) frame=\(String(describing: item.frame), privacy: .public)")
+        if logsDetails {
+            diagnosticLogger.info("Verification generation=\(generation) result=\(String(describing: result), privacy: .private)")
+            for item in snapshot.verificationItems where plan.conceals(item.id) {
+                diagnosticLogger.info("Remaining item \(item.id.bundleID, privacy: .private) frame=\(String(describing: item.frame), privacy: .public)")
+            }
         }
         switch visibilityLifecycle.verify(generation: generation, result: result, allowFailure: allowFailure) {
         case .confirmed:
-            NSLog("[Ice ModernMenuBar] verified hiding generation=%ld", generation)
+            if logsDetails {
+                NSLog("[Ice ModernMenuBar] verified hiding generation=%ld", generation)
+            }
             awaitingVisibility = false
             visibilityFailure = nil
             errorMessage = nil
@@ -393,6 +414,8 @@ final class ModernMenuBarManager: ObservableObject {
         watchdog.stop()
         timer?.cancel()
         timer = nil
+        appLaunchObserver?.cancel()
+        appLaunchObserver = nil
         visibilityRetryTask?.cancel()
         visibilityRetryTask = nil
         visibilityLifecycle.markIdle()
