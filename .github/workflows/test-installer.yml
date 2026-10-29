@@ -2,6 +2,7 @@ name: Test installer failure handling
 
 on:
   push:
+    branches: [main]
     paths:
       - build-and-install.sh
       - scripts/test-build-and-install.py
@@ -22,9 +23,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Check shell syntax

@@ -31,7 +31,7 @@ removes each fixture after the assertions, even when a test fails.
 
 ## Coverage and expected behavior
 
-The 21 black-box tests invoke the complete production installer:
+The 25 black-box tests invoke the complete production installer:
 
 | Scenario | Expected result |
 | --- | --- |
@@ -41,9 +41,10 @@ The 21 black-box tests invoke the complete production installer:
 | Nested-bundle enumeration failure | Abort before installation instead of silently skipping nested signing |
 | Destination copy partially writes then fails | Restore the exact old fixture; preserve failure status; relaunch only if stopped and launch enabled |
 | Destination verification failure | Remove replacement and restore old fixture; honor no-launch |
-| Failed first copy or first verification | Remove incomplete app when there was no previous installation |
+| Failed first copy or first verification | Remove incomplete app when there was no previous installation; if removal fails, report the app path |
 | Backup collision: directory, file, dangling symlink | Abort before stop/move; leave old app and collision untouched |
-| Moving old app to backup fails | Existing app retained; staging cleaned; failure status preserved |
+| Moving old app to backup fails, or creating the backup folder fails | Existing app retained; staging cleaned; failure status preserved |
+| SIGTERM (e.g. closed terminal) right after the backup move, or during the destination copy | Restore the old fixture; relaunch only if stopped; exit by the signal |
 | Removing incomplete app fails during rollback | Leave backup recoverable at its original path; never move it into the partial app; clean staging |
 | Moving backup back fails | Keep backup at reported path; clean staging; preserve original error status |
 | Successful replacement | Sign nested bundles before containing app; verify before launch; retain old backup |
@@ -75,6 +76,14 @@ does not exercise installer recovery.
   recovery made best-effort, removal must also be explicitly checked to avoid
   nesting the old app inside a still-existing partial destination. On failure,
   the backup stays at its reported location.
+- A follow-up review found that `BACKUP_PATH` and `INSTALL_STARTED` were only
+  set after the backup `mv`. A SIGTERM or SIGHUP arriving during that `mv` ran
+  the EXIT trap with recovery still off, leaving the destination missing (the
+  old app only in the backup folder). Both are now set before the move;
+  recovery skips the rollback when the recorded backup does not exist yet, so a
+  failure before or during the move never deletes the installed app. The mocks
+  send SIGTERM to the installer to cover this. A failed removal on a first
+  install now names the app path instead of an empty backup path.
 - Process substitution hid `find` failures. On this Linux execution host,
   `/dev/fd` process substitution also failed and nested bundles were skipped.
   Enumeration now writes a NUL-delimited list inside staging and checks `find`'s
