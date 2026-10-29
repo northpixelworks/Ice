@@ -1,0 +1,33 @@
+name: Test Ice
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: XCTest
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      # Match the toolchain used by the successful October 18 build.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Inspect test environment and schemes
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcodebuild -list -project Ice.xcodeproj
+
+      # Keep the whole suite enabled. The live MenuBarAgent test uses XCTSkip
+      # when that service is absent; see docs/TESTING.md for coverage limits.
+      - name: Run XCTest suite
+        run: xcodebuild -project Ice.xcodeproj -scheme Ice -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO test
