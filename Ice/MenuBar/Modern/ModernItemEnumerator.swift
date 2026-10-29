@@ -325,13 +325,18 @@ public actor ModernItemEnumerator {
         guard pid > 0 else { return nil }
         let app = NSRunningApplication(processIdentifier: pid)
         if let id = app?.bundleIdentifier { return HostBundle(id: id, bundleless: false) }
-        var url = app?.executableURL ?? executableURL(ofPID: pid)
-        while let current = url, current.path != "/" {
+        // Standardize first: Wine reports paths like ".../lib/wine/../../bin/wine",
+        // and deletingLastPathComponent() on a path ending in ".." appends
+        // another "/.." instead of shortening it, so the walk never ends.
+        var url = (app?.executableURL ?? executableURL(ofPID: pid))?.standardizedFileURL
+        while let current = url, current.path.hasPrefix("/"), current.path != "/" {
             if current.pathExtension == "app", let id = Bundle(url: current)?.bundleIdentifier {
                 logOnce("enumerate: bundle-less host → \(id) (\(app?.executableURL?.lastPathComponent ?? "?"))", pid: pid)
                 return HostBundle(id: id, bundleless: true)
             }
-            url = current.deletingLastPathComponent()
+            let parent = current.deletingLastPathComponent()
+            guard parent.path.count < current.path.count else { break }
+            url = parent
         }
         return nil
     }
