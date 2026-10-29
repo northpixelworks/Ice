@@ -10,6 +10,7 @@ STAGED_APP_PATH=""
 KEY_TMPDIR=""
 BACKUP_PATH=""
 INSTALL_DONE=0
+INSTALL_STARTED=0
 ICE_STOPPED=0
 DESTINATION_APP_PATH="${ICE_INSTALL_APP_PATH:-/Applications/Ice.app}"
 [[ "$DESTINATION_APP_PATH" == *.app ]] || { echo "ERROR: ICE_INSTALL_APP_PATH must end in .app: $DESTINATION_APP_PATH"; exit 1; }
@@ -18,6 +19,11 @@ LOGIN_KEYCHAIN="$(
     sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' || true
 )"
 LOGIN_KEYCHAIN="${LOGIN_KEYCHAIN:-${HOME}/Library/Keychains/login.keychain-db}"
+
+# Explicit template: macOS mktemp ignores TMPDIR without one.
+make_tmpdir() {
+  mktemp -d "${TMPDIR:-/tmp}/ice.XXXXXX"
+}
 
 cleanup_tmpdirs() {
   local dir
@@ -31,12 +37,18 @@ cleanup_tmpdirs() {
 # If anything fails after the installed app was moved to its backup, put the
 # backup back so a failed install never leaves Ice missing or half-copied.
 restore_backup_if_incomplete() {
-  if [[ "$INSTALL_DONE" == "1" || -z "$BACKUP_PATH" || ! -d "$BACKUP_PATH" ]]; then
-    return
+  if [[ "$INSTALL_DONE" == "1" || "$INSTALL_STARTED" != "1" ]]; then
+    return 0
   fi
 
+  if ! rm -rf "$DESTINATION_APP_PATH"; then
+    echo "  ERROR: Could not remove the incomplete app; previous app remains at $BACKUP_PATH"
+    return 1
+  fi
+  if [[ -z "$BACKUP_PATH" ]]; then
+    return 0
+  fi
   echo "  ERROR: Install did not finish; restoring the previous app."
-  rm -rf "$DESTINATION_APP_PATH"
   if mv "$BACKUP_PATH" "$DESTINATION_APP_PATH"; then
     echo "  Restored $DESTINATION_APP_PATH"
     if [[ "$ICE_STOPPED" == "1" && "${ICE_INSTALL_NO_LAUNCH:-0}" != "1" ]]; then
@@ -48,8 +60,13 @@ restore_backup_if_incomplete() {
 }
 
 on_exit() {
+  local status=$?
+  # Recovery must not short-circuit cleanup, or replace the install's status.
+  trap - EXIT
+  set +e
   restore_backup_if_incomplete
   cleanup_tmpdirs
+  exit "$status"
 }
 
 trap on_exit EXIT
@@ -68,7 +85,7 @@ create_local_signing_identity() {
   fi
 
   # Tracked globally so the EXIT trap removes the unencrypted key on interrupts.
-  KEY_TMPDIR="$(mktemp -d)" || return 1
+  KEY_TMPDIR="$(make_tmpdir)" || return 1
 
   local key_path="$KEY_TMPDIR/ice-local-dev.key"
   local cert_path="$KEY_TMPDIR/ice-local-dev.crt"
@@ -153,12 +170,16 @@ sign_app_with_identity() {
   local app_path="$1"
   local identity="$2"
   local codesign_args=(--force --sign "$identity" --timestamp=none)
+  local nested
+  local nested_list="$STAGING_TMPDIR/nested-bundles"
 
   # Sign nested beta services and frameworks from the inside out.
+  # Check find's status explicitly; process substitution hides its failures.
+  find "$app_path/Contents" -depth -type d \
+    \( -name '*.xpc' -o -name '*.app' -o -name '*.framework' \) -print0 > "$nested_list" || return 1
   while IFS= read -r -d '' nested; do
     codesign "${codesign_args[@]}" "$nested" || return 1
-  done < <(find "$app_path/Contents" -depth -type d \
-    \( -name '*.xpc' -o -name '*.app' -o -name '*.framework' \) -print0)
+  done < "$nested_list"
   codesign "${codesign_args[@]}" "$app_path" || return 1
   codesign --verify --deep --strict "$app_path"
 }
@@ -166,7 +187,7 @@ sign_app_with_identity() {
 # Sign a staged copy before touching the installed app, so a signing failure
 # never leaves a half-signed Ice in place (mixed signatures fail to load Sparkle).
 stage_and_sign_app() {
-  STAGING_TMPDIR="$(mktemp -d)"
+  STAGING_TMPDIR="$(make_tmpdir)"
   STAGED_APP_PATH="$STAGING_TMPDIR/Ice.app"
   ditto --norsrc --noextattr "$INSTALL_APP_PATH" "$STAGED_APP_PATH"
   # stdout only: codesign's errors still reach the terminal.
@@ -228,7 +249,7 @@ download_artifact_app() {
     exit 1
   fi
 
-  ARTIFACT_TMPDIR="$(mktemp -d)"
+  ARTIFACT_TMPDIR="$(make_tmpdir)"
   local download_dir="$ARTIFACT_TMPDIR/download"
   local app_dir="$ARTIFACT_TMPDIR/app"
   mkdir -p "$download_dir" "$app_dir"
@@ -287,9 +308,9 @@ stage_and_sign_app
 # Pick the backup name before stopping Ice, so a name clash exits with Ice untouched.
 backup_dir="${DESTINATION_APP_PATH%.app}-backups.noindex"
 backup_path=""
-if [[ -e "$DESTINATION_APP_PATH" ]]; then
+if [[ -e "$DESTINATION_APP_PATH" || -L "$DESTINATION_APP_PATH" ]]; then
   backup_path="$backup_dir/Ice-$(date +%Y%m%d-%H%M%S).app"
-  [[ ! -e "$backup_path" ]] || { echo "ERROR: Backup already exists: $backup_path"; exit 1; }
+  [[ ! -e "$backup_path" && ! -L "$backup_path" ]] || { echo "ERROR: Backup already exists: $backup_path"; exit 1; }
 fi
 
 if [[ "${ICE_INSTALL_NO_STOP:-0}" != "1" ]]; then
@@ -307,6 +328,7 @@ if [[ -n "$backup_path" ]]; then
   BACKUP_PATH="$backup_path"
   echo "  Previous app preserved at $backup_path"
 fi
+INSTALL_STARTED=1
 ditto --norsrc --noextattr "$STAGED_APP_PATH" "$DESTINATION_APP_PATH"
 codesign --verify --deep --strict "$DESTINATION_APP_PATH"
 INSTALL_DONE=1
