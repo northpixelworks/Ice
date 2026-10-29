@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,7 @@ INSTALLER = Path(__file__).resolve().parents[1] / "build-and-install.sh"
 # One dispatcher installed under every mocked command name. Filesystem writes
 # are guarded even if an installer regression accidentally uses /Applications.
 MOCK = r'''
-import json, os, pathlib, shutil, subprocess, sys
+import json, os, pathlib, shutil, signal, subprocess, sys
 p = pathlib.Path
 root = p(os.environ["TEST_ROOT"]).resolve()
 name, args = p(sys.argv[0]).name, sys.argv[1:]
@@ -28,6 +29,9 @@ def safe(value):
     return path
 def fail():
     sys.exit(23)
+def interrupt():
+    # Like a closed terminal: bash runs its EXIT trap once this command returns.
+    os.kill(os.getppid(), signal.SIGTERM)
 if name == "security":
     if args[0] == "default-keychain":
         print('"' + str(root / "fake.keychain-db") + '"')
@@ -63,6 +67,11 @@ elif name == "ditto":
         target.mkdir(parents=True, exist_ok=True)
         (target / "partial").write_text("incomplete")
         fail()
+    if mode == "interrupt_during_copy" and str(target) == dest:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "partial").write_text("incomplete")
+        interrupt()
+        sys.exit(0)
     shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
 elif name == "mv":
     source, target = map(safe, args)
@@ -72,6 +81,8 @@ elif name == "mv":
         fail()
     # Match mv's existing-directory semantics (important for collision tests).
     shutil.move(str(source), str(target))
+    if mode == "interrupt_after_backup" and str(source) == dest:
+        interrupt()
 elif name == "rm":
     for arg in args:
         if arg.startswith("-"):
@@ -272,6 +283,12 @@ class InstallerTests(unittest.TestCase):
         self.assert_old()
         self.assert_clean()
 
+    def test_backup_dir_failure_leaves_app(self):
+        self.backups.write_text("not a directory")  # mkdir -p fails
+        self.assertNotEqual(self.run_install().returncode, 0)
+        self.assert_old()
+        self.assert_clean()
+
     def test_restore_move_failure_keeps_backup_and_cleans_staging(self):
         self.assertEqual(self.run_install("restore_move_fail").returncode, 23)
         self.assertEqual((self.backup / "Contents/version").read_text(), "old")
@@ -283,6 +300,28 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.backup / "Contents/version").read_text(), "old")
         self.assertFalse((self.dest / self.backup.name).exists())
         self.assertIn(str(self.backup), self.result.stdout)
+        self.assert_clean()
+
+    def test_failed_first_install_remove_failure_reports_app(self):
+        shutil.rmtree(self.dest)
+        self.assertEqual(self.run_install("restore_remove_fail").returncode, 23)
+        self.assertIn("Could not remove the incomplete app at " + str(self.dest), self.result.stdout)
+        self.assertNotIn("previous app remains", self.result.stdout)
+        self.assert_clean()
+
+    def test_interrupt_after_backup_restores_app(self):
+        # SIGTERM lands between moving the old app away and copying the new one.
+        self.assertEqual(self.run_install("interrupt_after_backup", stop=True, launch=True).returncode, -signal.SIGTERM)
+        self.assert_old()
+        self.assertFalse(self.backup.exists())
+        self.assertEqual([args for name, args in self.events if name == "open"], [[str(self.dest)]])
+        self.assertFalse(any(name == "ditto" and args[-1] == str(self.dest) for name, args in self.events))
+        self.assert_clean()
+
+    def test_interrupt_during_copy_restores_app(self):
+        self.assertEqual(self.run_install("interrupt_during_copy").returncode, -signal.SIGTERM)
+        self.assert_old()
+        self.assertFalse(self.backup.exists())
         self.assert_clean()
 
     def test_success_keeps_backup_and_verifies_before_launch(self):

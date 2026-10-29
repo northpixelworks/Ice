@@ -40,9 +40,17 @@ restore_backup_if_incomplete() {
   if [[ "$INSTALL_DONE" == "1" || "$INSTALL_STARTED" != "1" ]]; then
     return 0
   fi
+  # Interrupted or failed before the backup move: the installed app is untouched.
+  if [[ -n "$BACKUP_PATH" && ! -e "$BACKUP_PATH" && ! -L "$BACKUP_PATH" ]]; then
+    return 0
+  fi
 
   if ! rm -rf "$DESTINATION_APP_PATH"; then
-    echo "  ERROR: Could not remove the incomplete app; previous app remains at $BACKUP_PATH"
+    if [[ -n "$BACKUP_PATH" ]]; then
+      echo "  ERROR: Could not remove the incomplete app; previous app remains at $BACKUP_PATH"
+    else
+      echo "  ERROR: Could not remove the incomplete app at $DESTINATION_APP_PATH"
+    fi
     return 1
   fi
   if [[ -z "$BACKUP_PATH" ]]; then
@@ -324,8 +332,10 @@ fi
 echo "=== Installing ==="
 if [[ -n "$backup_path" ]]; then
   mkdir -p "$backup_dir"
-  mv "$DESTINATION_APP_PATH" "$backup_path"
+  # Record the backup before the move, so an interrupt right after it still restores.
   BACKUP_PATH="$backup_path"
+  INSTALL_STARTED=1
+  mv "$DESTINATION_APP_PATH" "$backup_path"
   echo "  Previous app preserved at $backup_path"
 fi
 INSTALL_STARTED=1
