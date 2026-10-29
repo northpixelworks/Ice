@@ -7,48 +7,73 @@ INSTALL_APP_PATH=""
 ARTIFACT_TMPDIR=""
 STAGING_TMPDIR=""
 STAGED_APP_PATH=""
+KEY_TMPDIR=""
+BACKUP_PATH=""
+INSTALL_DONE=0
+ICE_STOPPED=0
 DESTINATION_APP_PATH="${ICE_INSTALL_APP_PATH:-/Applications/Ice.app}"
+[[ "$DESTINATION_APP_PATH" == *.app ]] || { echo "ERROR: ICE_INSTALL_APP_PATH must end in .app: $DESTINATION_APP_PATH"; exit 1; }
 LOGIN_KEYCHAIN="$(
   security default-keychain -d user 2>/dev/null |
     sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' || true
 )"
 LOGIN_KEYCHAIN="${LOGIN_KEYCHAIN:-${HOME}/Library/Keychains/login.keychain-db}"
 
-cleanup_artifact_tmpdir() {
-  if [[ -n "$ARTIFACT_TMPDIR" && -d "$ARTIFACT_TMPDIR" ]]; then
-    rm -rf "$ARTIFACT_TMPDIR"
+cleanup_tmpdirs() {
+  local dir
+  for dir in "$ARTIFACT_TMPDIR" "$STAGING_TMPDIR" "$KEY_TMPDIR"; do
+    if [[ -n "$dir" && -d "$dir" ]]; then
+      rm -rf "$dir"
+    fi
+  done
+}
+
+# If anything fails after the installed app was moved to its backup, put the
+# backup back so a failed install never leaves Ice missing or half-copied.
+restore_backup_if_incomplete() {
+  if [[ "$INSTALL_DONE" == "1" || -z "$BACKUP_PATH" || ! -d "$BACKUP_PATH" ]]; then
+    return
   fi
-  if [[ -n "$STAGING_TMPDIR" && -d "$STAGING_TMPDIR" ]]; then
-    rm -rf "$STAGING_TMPDIR"
+
+  echo "  ERROR: Install did not finish; restoring the previous app."
+  rm -rf "$DESTINATION_APP_PATH"
+  if mv "$BACKUP_PATH" "$DESTINATION_APP_PATH"; then
+    echo "  Restored $DESTINATION_APP_PATH"
+    if [[ "$ICE_STOPPED" == "1" && "${ICE_INSTALL_NO_LAUNCH:-0}" != "1" ]]; then
+      open "$DESTINATION_APP_PATH" || true
+    fi
+  else
+    echo "  ERROR: Could not restore the previous app; it is still at $BACKUP_PATH"
   fi
 }
 
-trap cleanup_artifact_tmpdir EXIT
+on_exit() {
+  restore_backup_if_incomplete
+  cleanup_tmpdirs
+}
+
+trap on_exit EXIT
 
 # No -v: the self-signed certificate is never "trusted", but codesign can still
 # use it, and its fixed fingerprint keeps the Accessibility grant across builds.
 find_local_signing_identity() {
   security find-identity -p codesigning 2>/dev/null |
-    awk -v name="$SIGNING_IDENTITY_NAME" '$0 ~ "\"" name "\"" { print $2; exit }'
-}
-
-cleanup_and_fail() {
-  rm -rf "$1"
-  return 1
+    awk -v name="$SIGNING_IDENTITY_NAME" '$0 ~ "\"" name "\"" { print $2; exit }' || true
 }
 
 create_local_signing_identity() {
   if ! command -v openssl >/dev/null 2>&1; then
-    echo "  WARN: openssl not found; falling back to ad-hoc signing."
+    echo "  WARN: openssl not found."
     return 1
   fi
 
-  local tmpdir
-  tmpdir="$(mktemp -d)"
+  # Tracked globally so the EXIT trap removes the unencrypted key on interrupts.
+  KEY_TMPDIR="$(mktemp -d)" || return 1
 
-  local key_path="$tmpdir/ice-local-dev.key"
-  local cert_path="$tmpdir/ice-local-dev.crt"
-  local p12_path="$tmpdir/ice-local-dev.p12"
+  local key_path="$KEY_TMPDIR/ice-local-dev.key"
+  local cert_path="$KEY_TMPDIR/ice-local-dev.crt"
+  local p12_path="$KEY_TMPDIR/ice-local-dev.p12"
+  # Throwaway password: the .p12 only carries the key into the keychain.
   local p12_password="ice-local-development"
 
   openssl req \
@@ -61,10 +86,11 @@ create_local_signing_identity() {
     -out "$cert_path" \
     -subj "/CN=${SIGNING_IDENTITY_NAME}" \
     -addext "keyUsage=digitalSignature" \
-    -addext "extendedKeyUsage=codeSigning" >/dev/null 2>&1 || { cleanup_and_fail "$tmpdir"; return 1; }
+    -addext "extendedKeyUsage=codeSigning" >/dev/null 2>&1 || return 1
 
   # OpenSSL 3+ defaults to AES/PBKDF2 PKCS#12, which `security import` rejects
   # ("MAC verification failed"); force the SHA1/3DES format macOS understands.
+  # Tested with Homebrew OpenSSL 4.1 and macOS LibreSSL 3.3.
   openssl pkcs12 \
     -export \
     -keypbe PBE-SHA1-3DES \
@@ -74,21 +100,30 @@ create_local_signing_identity() {
     -in "$cert_path" \
     -out "$p12_path" \
     -name "$SIGNING_IDENTITY_NAME" \
-    -passout pass:"$p12_password" >/dev/null 2>&1 || { cleanup_and_fail "$tmpdir"; return 1; }
+    -passout pass:"$p12_password" >/dev/null 2>&1 || return 1
+  rm -f "$key_path"
 
   if ! security import "$p12_path" \
     -k "$LOGIN_KEYCHAIN" \
     -P "$p12_password" \
     -T /usr/bin/codesign >/dev/null; then
     echo "  WARN: Could not import the local signing identity into ${LOGIN_KEYCHAIN}."
-    cleanup_and_fail "$tmpdir"
     return 1
   fi
 
-  rm -rf "$tmpdir"
+  rm -rf "$KEY_TMPDIR"
+  KEY_TMPDIR=""
 }
 
+ADHOC_HINT="Set ICE_ADHOC_SIGNING=1 to install ad-hoc anyway (Accessibility must then be re-approved)."
+
 resolve_signing_identity() {
+  if [[ "${ICE_ADHOC_SIGNING:-0}" == "1" ]]; then
+    SIGNING_IDENTITY="-"
+    echo "  WARN: ICE_ADHOC_SIGNING=1: signing ad-hoc; Accessibility will need re-approval."
+    return
+  fi
+
   local identity
   identity="$(find_local_signing_identity)"
   if [[ -n "$identity" ]]; then
@@ -107,9 +142,11 @@ resolve_signing_identity() {
     return
   fi
 
-  SIGNING_IDENTITY="-"
-  echo "  WARN: Could not create a stable local signing identity."
-  echo "  WARN: This install will be ad-hoc signed and may need Accessibility approval again."
+  # Stop rather than silently switching to ad-hoc: a new signature loses the
+  # Accessibility grant. Ice has not been stopped or changed at this point.
+  echo "  ERROR: Could not create a stable local signing identity; the installed app was not changed."
+  echo "  $ADHOC_HINT"
+  exit 1
 }
 
 sign_app_with_identity() {
@@ -132,21 +169,16 @@ stage_and_sign_app() {
   STAGING_TMPDIR="$(mktemp -d)"
   STAGED_APP_PATH="$STAGING_TMPDIR/Ice.app"
   ditto --norsrc --noextattr "$INSTALL_APP_PATH" "$STAGED_APP_PATH"
+  # stdout only: codesign's errors still reach the terminal.
   if sign_app_with_identity "$STAGED_APP_PATH" "$SIGNING_IDENTITY" >/dev/null; then
     return
   fi
 
-  if [[ "$SIGNING_IDENTITY" == "-" ]]; then
-    echo "  ERROR: Ad-hoc signing failed; the installed app was not changed."
-    exit 1
+  echo "  ERROR: Signing failed; the installed app was not changed."
+  if [[ "$SIGNING_IDENTITY" != "-" ]]; then
+    echo "  $ADHOC_HINT"
   fi
-
-  echo "  WARN: Signing with ${SIGNING_IDENTITY_NAME} failed; falling back to ad-hoc signing."
-  SIGNING_IDENTITY="-"
-  rm -rf "$STAGED_APP_PATH"
-  ditto --norsrc --noextattr "$INSTALL_APP_PATH" "$STAGED_APP_PATH"
-  sign_app_with_identity "$STAGED_APP_PATH" "-" >/dev/null ||
-    { echo "  ERROR: Ad-hoc signing failed; the installed app was not changed."; exit 1; }
+  exit 1
 }
 
 xcodebuild_available() {
@@ -252,23 +284,32 @@ resolve_signing_identity
 echo "=== Signing ==="
 stage_and_sign_app
 
+# Pick the backup name before stopping Ice, so a name clash exits with Ice untouched.
+backup_dir="${DESTINATION_APP_PATH%.app}-backups.noindex"
+backup_path=""
+if [[ -e "$DESTINATION_APP_PATH" ]]; then
+  backup_path="$backup_dir/Ice-$(date +%Y%m%d-%H%M%S).app"
+  [[ ! -e "$backup_path" ]] || { echo "ERROR: Backup already exists: $backup_path"; exit 1; }
+fi
+
 if [[ "${ICE_INSTALL_NO_STOP:-0}" != "1" ]]; then
   echo "=== Stopping Ice ==="
-  pkill -x Ice 2>/dev/null || true
+  if pkill -x Ice 2>/dev/null; then
+    ICE_STOPPED=1
+  fi
   sleep 1
 fi
 
 echo "=== Installing ==="
-if [[ -e "$DESTINATION_APP_PATH" ]]; then
-  backup_dir="${DESTINATION_APP_PATH%.app}-backups.noindex"
+if [[ -n "$backup_path" ]]; then
   mkdir -p "$backup_dir"
-  backup_path="$backup_dir/Ice-$(date +%Y%m%d-%H%M%S).app"
-  [[ ! -e "$backup_path" ]] || { echo "ERROR: Backup already exists: $backup_path"; exit 1; }
   mv "$DESTINATION_APP_PATH" "$backup_path"
+  BACKUP_PATH="$backup_path"
   echo "  Previous app preserved at $backup_path"
 fi
 ditto --norsrc --noextattr "$STAGED_APP_PATH" "$DESTINATION_APP_PATH"
 codesign --verify --deep --strict "$DESTINATION_APP_PATH"
+INSTALL_DONE=1
 
 if [[ "${ICE_INSTALL_NO_LAUNCH:-0}" != "1" ]]; then
   echo "=== Launching ==="
@@ -276,8 +317,9 @@ if [[ "${ICE_INSTALL_NO_LAUNCH:-0}" != "1" ]]; then
 fi
 
 if [[ "$SIGNING_IDENTITY" == "-" ]]; then
-  echo "=== Done! Existing permissions were left in place, but this app is ad-hoc signed ==="
+  echo "=== Done! Ice is ad-hoc signed: macOS will likely ask for Accessibility again ==="
+  echo "In Accessibility, remove Ice with − and add /Applications/Ice.app again."
 else
-  echo "=== Done! Existing permissions were left in place ==="
-  echo "If this is the first stable local-signed install, approve Ice once in Accessibility."
+  echo "=== Done! Signed with ${SIGNING_IDENTITY_NAME}; an existing Accessibility grant is kept ==="
+  echo "If Ice still asks for Accessibility, remove it with − in Accessibility and add /Applications/Ice.app again (once per certificate)."
 fi
