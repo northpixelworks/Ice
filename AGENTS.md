@@ -13,6 +13,7 @@ This repository is prepared for both Codex and Claude Code. `AGENTS.md` is the s
 ### Common Commands
 - Xcode project: inspect schemes with `xcodebuild -list -project Ice.xcodeproj` before building.
 - Debug build after confirming the scheme: `xcodebuild -project Ice.xcodeproj -scheme Ice -configuration Debug build`.
+- The shared `Ice` scheme runs `scripts/unregister-build-products.sh` after build and test so `build.noindex` copies of Ice.app do not stay registered in Launch Services.
 - Use a full Xcode installation; Command Line Tools alone are not enough for normal project builds.
 - macOS tests: `xcodebuild -project Ice.xcodeproj -scheme Ice -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO test`.
 

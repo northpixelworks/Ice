@@ -33,6 +33,10 @@ All notable changes to Ice are tracked here retroactively from the available git
 - Fix capture-buffer lifetime, initial image-cache sizing, and scene-window ID validation; keep setup idempotent and avoid deactivation on last-window close on macOS 27.
 - Fix Settings window presentation with scene-bound window actions and native foreground ordering; restore minimized windows and reopen Settings when Ice is opened from Finder.
 
+### Build tooling
+- Unregister build copies of Ice from Launch Services after every build and test run. Xcode's built-in RegisterWithLaunchServices step (no build setting disables it) and test runs (which launch the Debug app as test host) registered `build.noindex` copies of `Ice.app`, which showed up as duplicate Ice entries next to `/Applications/Ice.app` in Accessibility, Login Items and Open With. The shared `Ice` scheme now runs `scripts/unregister-build-products.sh` as a build and test post-action; it calls `lsregister -u` on every `*.app` under the build products folder, including nested Sparkle `Updater.app`.
+- `build-and-install.sh` now defaults to the renamed GitHub repo `northpixelworks/Ice` for artifacts.
+
 ### Audit fixes
 - Keep auxiliary spacing fixed during a reveal so Portworth movement cannot grow the divider and push hidden icons out of view.
 - Respect the auto-rehide toggle for focused-app changes, including while a delayed hide is pending.

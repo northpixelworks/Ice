@@ -164,7 +164,7 @@ build_local_app() {
 }
 
 download_artifact_app() {
-  local repo="${ICE_ARTIFACT_REPO:-mariowabnig/Ice}"
+  local repo="${ICE_ARTIFACT_REPO:-northpixelworks/Ice}"
   local workflow="${ICE_ARTIFACT_WORKFLOW:-build-artifact.yml}"
   local branch="${ICE_ARTIFACT_BRANCH:-main}"
   local artifact_name="${ICE_ARTIFACT_NAME:-Ice-app}"

@@ -35,6 +35,24 @@
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
+      <PostActions>
+         <ExecutionAction
+            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+            <ActionContent
+               title = "Unregister build products from Launch Services"
+               scriptText = "&quot;${PROJECT_DIR}/scripts/unregister-build-products.sh&quot;&#10;">
+               <EnvironmentBuildable>
+                  <BuildableReference
+                     BuildableIdentifier = "primary"
+                     BlueprintIdentifier = "716683292A767E6A006ABF84"
+                     BuildableName = "Ice.app"
+                     BlueprintName = "Ice"
+                     ReferencedContainer = "container:Ice.xcodeproj">
+                  </BuildableReference>
+               </EnvironmentBuildable>
+            </ActionContent>
+         </ExecutionAction>
+      </PostActions>
    </BuildAction>
    <TestAction
       buildConfiguration = "Debug"
@@ -55,6 +73,24 @@
             </BuildableReference>
          </TestableReference>
       </Testables>
+      <PostActions>
+         <ExecutionAction
+            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+            <ActionContent
+               title = "Unregister build products from Launch Services"
+               scriptText = "&quot;${PROJECT_DIR}/scripts/unregister-build-products.sh&quot;&#10;">
+               <EnvironmentBuildable>
+                  <BuildableReference
+                     BuildableIdentifier = "primary"
+                     BlueprintIdentifier = "716683292A767E6A006ABF84"
+                     BuildableName = "Ice.app"
+                     BlueprintName = "Ice"
+                     ReferencedContainer = "container:Ice.xcodeproj">
+                  </BuildableReference>
+               </EnvironmentBuildable>
+            </ActionContent>
+         </ExecutionAction>
+      </PostActions>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
