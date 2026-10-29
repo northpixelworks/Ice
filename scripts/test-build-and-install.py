@@ -56,7 +56,7 @@ elif name == "codesign":
     if "--verify" in args:
         if mode == "stage_verify_fail" and str(target) != dest:
             fail()
-        if mode in ("verify_fail", "restore_move_fail", "restore_remove_fail") and str(target) == dest:
+        if mode in ("verify_fail", "restore_move_fail", "restore_remove_fail", "interrupt_during_restore") and str(target) == dest:
             fail()
     else:
         if mode == "sign_fail" or (mode == "nested_sign_fail" and target.suffix == ".xpc"):
@@ -90,6 +90,10 @@ elif name == "mv":
         time.sleep(0.5)
     if mode == "restore_move_fail" and str(target) == dest:
         fail()
+    if mode == "interrupt_during_restore" and str(target) == dest:
+        # A second signal while rollback's mv runs must not start recovery again.
+        interrupt()
+        time.sleep(0.5)
     # Match mv's existing-directory semantics (important for collision tests).
     shutil.move(str(source), str(target))
     if mode == "interrupt_after_backup" and str(source) == dest:
@@ -343,6 +347,12 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.run_install("backup_partial_fail").returncode, 23)
         self.assert_old()
         self.assertTrue((self.backup / "partial").exists())
+        self.assert_clean()
+
+    def test_interrupt_during_restore_keeps_restored_app(self):
+        self.assertEqual(self.run_install("interrupt_during_restore").returncode, -signal.SIGTERM)
+        self.assert_old()
+        self.assertFalse(self.backup.exists())
         self.assert_clean()
 
     def test_interrupt_during_copy_restores_app(self):

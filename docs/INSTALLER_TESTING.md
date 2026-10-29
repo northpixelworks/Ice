@@ -38,7 +38,7 @@ environment in a folder named `Ice fork`) still works.
 
 ## Coverage and expected behavior
 
-The 27 black-box tests invoke the complete production installer (plus one
+The 28 black-box tests invoke the complete production installer (plus one
 harness self-test for the `..` guard):
 
 | Scenario | Expected result |
@@ -54,6 +54,7 @@ harness self-test for the `..` guard):
 | Moving old app to backup fails, or creating the backup folder fails | Existing app retained; staging cleaned; failure status preserved |
 | Backup move fails after writing a partial backup (cross-filesystem `mv` copies) | Existing app retained, never replaced by the partial backup |
 | SIGTERM (e.g. closed terminal) while the backup `mv` is still running, right after it, or during the destination copy | Wait for the running command, then restore the old fixture; relaunch only if stopped; exit by the signal |
+| SIGTERM while rollback's `mv` puts the old app back | Finish that rollback once, keep the restored app, then exit by the signal |
 | Removing incomplete app fails during rollback | Leave backup recoverable at its original path; never move it into the partial app; clean staging |
 | Moving backup back fails | Keep backup at reported path; clean staging; preserve original error status |
 | Successful replacement | Sign nested bundles before containing app; verify before launch; retain old backup |
@@ -102,6 +103,11 @@ does not exercise installer recovery.
   a partial backup left by a failed cross-filesystem `mv`. Recovery now never
   touches an app at the destination until `COPY_STARTED` marks that the copy of
   the new app has begun.
+- Copilot's review of that change found that the new signal traps stayed active
+  during recovery: a SIGTERM while rollback's `mv` put the old app back ran
+  recovery a second time, which deleted the restored app with the backup already
+  used up. Recovery now runs once; a signal arriving during it is only recorded,
+  and the installer exits by that signal after recovery and cleanup finish.
 - Process substitution hid `find` failures. On this Linux execution host,
   `/dev/fd` process substitution also failed and nested bundles were skipped.
   Enumeration now writes a NUL-delimited list inside staging and checks `find`'s

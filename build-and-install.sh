@@ -12,6 +12,7 @@ BACKUP_PATH=""
 INSTALL_DONE=0
 INSTALL_STARTED=0
 COPY_STARTED=0
+PENDING_SIGNAL=""
 ICE_STOPPED=0
 DESTINATION_APP_PATH="${ICE_INSTALL_APP_PATH:-/Applications/Ice.app}"
 [[ "$DESTINATION_APP_PATH" == *.app ]] || { echo "ERROR: ICE_INSTALL_APP_PATH must end in .app: $DESTINATION_APP_PATH"; exit 1; }
@@ -69,24 +70,34 @@ restore_backup_if_incomplete() {
   fi
 }
 
-on_exit() {
-  local status=$?
-  # Recovery must not short-circuit cleanup, or replace the install's status.
+# Recovery runs once: a signal arriving during it is held until it finishes
+# (a second run would delete the app it just restored), then exits by it.
+finish() {
   trap - EXIT
+  trap 'PENDING_SIGNAL="${PENDING_SIGNAL:-HUP}"' HUP
+  trap 'PENDING_SIGNAL="${PENDING_SIGNAL:-INT}"' INT
+  trap 'PENDING_SIGNAL="${PENDING_SIGNAL:-TERM}"' TERM
   set +e
   restore_backup_if_incomplete
   cleanup_tmpdirs
+  if [[ -n "$PENDING_SIGNAL" ]]; then
+    trap - "$PENDING_SIGNAL"
+    kill -s "$PENDING_SIGNAL" "$$"
+  fi
+}
+
+on_exit() {
+  local status=$?
+  # Recovery must not short-circuit cleanup, or replace the install's status.
+  finish
   exit "$status"
 }
 
 # Bash runs a signal trap only after the running command returns, so recovery
 # never races a half-finished `mv` or `ditto`. Then exit by the same signal.
 on_signal() {
-  trap - EXIT HUP INT TERM
-  set +e
-  restore_backup_if_incomplete
-  cleanup_tmpdirs
-  kill -s "$1" "$$"
+  PENDING_SIGNAL="$1"
+  finish
 }
 
 trap on_exit EXIT
