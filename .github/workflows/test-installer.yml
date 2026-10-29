@@ -1,0 +1,33 @@
+name: Test installer failure handling
+
+on:
+  push:
+    paths:
+      - build-and-install.sh
+      - scripts/test-build-and-install.py
+      - .github/workflows/test-installer.yml
+  pull_request:
+    paths:
+      - build-and-install.sh
+      - scripts/test-build-and-install.py
+      - .github/workflows/test-installer.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check shell syntax
+        run: bash -n build-and-install.sh
+      - name: Run isolated installer tests
+        run: python3 scripts/test-build-and-install.py
