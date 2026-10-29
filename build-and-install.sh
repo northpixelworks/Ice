@@ -5,6 +5,8 @@ SIGNING_IDENTITY_NAME="Ice Local Development"
 SIGNING_IDENTITY="-"
 INSTALL_APP_PATH=""
 ARTIFACT_TMPDIR=""
+STAGING_TMPDIR=""
+STAGED_APP_PATH=""
 DESTINATION_APP_PATH="${ICE_INSTALL_APP_PATH:-/Applications/Ice.app}"
 LOGIN_KEYCHAIN="$(
   security default-keychain -d user 2>/dev/null |
@@ -16,12 +18,17 @@ cleanup_artifact_tmpdir() {
   if [[ -n "$ARTIFACT_TMPDIR" && -d "$ARTIFACT_TMPDIR" ]]; then
     rm -rf "$ARTIFACT_TMPDIR"
   fi
+  if [[ -n "$STAGING_TMPDIR" && -d "$STAGING_TMPDIR" ]]; then
+    rm -rf "$STAGING_TMPDIR"
+  fi
 }
 
 trap cleanup_artifact_tmpdir EXIT
 
+# No -v: the self-signed certificate is never "trusted", but codesign can still
+# use it, and its fixed fingerprint keeps the Accessibility grant across builds.
 find_local_signing_identity() {
-  security find-identity -v -p codesigning 2>/dev/null |
+  security find-identity -p codesigning 2>/dev/null |
     awk -v name="$SIGNING_IDENTITY_NAME" '$0 ~ "\"" name "\"" { print $2; exit }'
 }
 
@@ -54,27 +61,28 @@ create_local_signing_identity() {
     -out "$cert_path" \
     -subj "/CN=${SIGNING_IDENTITY_NAME}" \
     -addext "keyUsage=digitalSignature" \
-    -addext "extendedKeyUsage=codeSigning" >/dev/null 2>&1 || cleanup_and_fail "$tmpdir"
+    -addext "extendedKeyUsage=codeSigning" >/dev/null 2>&1 || { cleanup_and_fail "$tmpdir"; return 1; }
 
+  # OpenSSL 3+ defaults to AES/PBKDF2 PKCS#12, which `security import` rejects
+  # ("MAC verification failed"); force the SHA1/3DES format macOS understands.
   openssl pkcs12 \
     -export \
+    -keypbe PBE-SHA1-3DES \
+    -certpbe PBE-SHA1-3DES \
+    -macalg sha1 \
     -inkey "$key_path" \
     -in "$cert_path" \
     -out "$p12_path" \
     -name "$SIGNING_IDENTITY_NAME" \
-    -passout pass:"$p12_password" >/dev/null 2>&1 || cleanup_and_fail "$tmpdir"
+    -passout pass:"$p12_password" >/dev/null 2>&1 || { cleanup_and_fail "$tmpdir"; return 1; }
 
-  security import "$p12_path" \
+  if ! security import "$p12_path" \
     -k "$LOGIN_KEYCHAIN" \
     -P "$p12_password" \
-    -T /usr/bin/codesign >/dev/null 2>&1 || cleanup_and_fail "$tmpdir"
-
-  if ! security add-trusted-cert \
-    -r trustRoot \
-    -p codeSign \
-    -k "$LOGIN_KEYCHAIN" \
-    "$cert_path" >/dev/null 2>&1; then
-    echo "  WARN: Could not mark the local signing certificate trusted; trying it anyway."
+    -T /usr/bin/codesign >/dev/null; then
+    echo "  WARN: Could not import the local signing identity into ${LOGIN_KEYCHAIN}."
+    cleanup_and_fail "$tmpdir"
+    return 1
   fi
 
   rm -rf "$tmpdir"
@@ -104,30 +112,41 @@ resolve_signing_identity() {
   echo "  WARN: This install will be ad-hoc signed and may need Accessibility approval again."
 }
 
-sign_installed_app_with_identity() {
-  local identity="$1"
+sign_app_with_identity() {
+  local app_path="$1"
+  local identity="$2"
   local codesign_args=(--force --sign "$identity" --timestamp=none)
 
   # Sign nested beta services and frameworks from the inside out.
   while IFS= read -r -d '' nested; do
     codesign "${codesign_args[@]}" "$nested" || return 1
-  done < <(find "$DESTINATION_APP_PATH/Contents" -depth -type d \
+  done < <(find "$app_path/Contents" -depth -type d \
     \( -name '*.xpc' -o -name '*.app' -o -name '*.framework' \) -print0)
-  codesign "${codesign_args[@]}" "$DESTINATION_APP_PATH" || return 1
-  codesign --verify --deep --strict "$DESTINATION_APP_PATH"
+  codesign "${codesign_args[@]}" "$app_path" || return 1
+  codesign --verify --deep --strict "$app_path"
 }
 
-codesign_installed_app() {
-  if sign_installed_app_with_identity "$SIGNING_IDENTITY"; then
+# Sign a staged copy before touching the installed app, so a signing failure
+# never leaves a half-signed Ice in place (mixed signatures fail to load Sparkle).
+stage_and_sign_app() {
+  STAGING_TMPDIR="$(mktemp -d)"
+  STAGED_APP_PATH="$STAGING_TMPDIR/Ice.app"
+  ditto --norsrc --noextattr "$INSTALL_APP_PATH" "$STAGED_APP_PATH"
+  if sign_app_with_identity "$STAGED_APP_PATH" "$SIGNING_IDENTITY" >/dev/null; then
     return
   fi
 
   if [[ "$SIGNING_IDENTITY" == "-" ]]; then
-    return 1
+    echo "  ERROR: Ad-hoc signing failed; the installed app was not changed."
+    exit 1
   fi
 
-  echo "  ERROR: Stable local signing failed; keeping the previous app for recovery."
-  return 1
+  echo "  WARN: Signing with ${SIGNING_IDENTITY_NAME} failed; falling back to ad-hoc signing."
+  SIGNING_IDENTITY="-"
+  rm -rf "$STAGED_APP_PATH"
+  ditto --norsrc --noextattr "$INSTALL_APP_PATH" "$STAGED_APP_PATH"
+  sign_app_with_identity "$STAGED_APP_PATH" "-" >/dev/null ||
+    { echo "  ERROR: Ad-hoc signing failed; the installed app was not changed."; exit 1; }
 }
 
 xcodebuild_available() {
@@ -230,6 +249,9 @@ fi
 echo "=== Preparing signing identity ==="
 resolve_signing_identity
 
+echo "=== Signing ==="
+stage_and_sign_app
+
 if [[ "${ICE_INSTALL_NO_STOP:-0}" != "1" ]]; then
   echo "=== Stopping Ice ==="
   pkill -x Ice 2>/dev/null || true
@@ -245,8 +267,8 @@ if [[ -e "$DESTINATION_APP_PATH" ]]; then
   mv "$DESTINATION_APP_PATH" "$backup_path"
   echo "  Previous app preserved at $backup_path"
 fi
-ditto --norsrc --noextattr "$INSTALL_APP_PATH" "$DESTINATION_APP_PATH"
-codesign_installed_app
+ditto --norsrc --noextattr "$STAGED_APP_PATH" "$DESTINATION_APP_PATH"
+codesign --verify --deep --strict "$DESTINATION_APP_PATH"
 
 if [[ "${ICE_INSTALL_NO_LAUNCH:-0}" != "1" ]]; then
   echo "=== Launching ==="
