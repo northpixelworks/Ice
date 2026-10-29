@@ -14,7 +14,7 @@ INSTALLER = Path(__file__).resolve().parents[1] / "build-and-install.sh"
 # One dispatcher installed under every mocked command name. Filesystem writes
 # are guarded even if an installer regression accidentally uses /Applications.
 MOCK = r'''
-import json, os, pathlib, shutil, signal, subprocess, sys
+import json, os, pathlib, shutil, signal, subprocess, sys, time
 p = pathlib.Path
 root = p(os.environ["TEST_ROOT"]).resolve()
 name, args = p(sys.argv[0]).name, sys.argv[1:]
@@ -24,6 +24,8 @@ with (root / "events").open("a") as f:
     f.write(json.dumps([name, args]) + "\n")
 def safe(value):
     path = p(value)
+    # No "..": mkdir -p creates each component before resolving the next one.
+    assert ".." not in path.parts, value
     # Check the parent without following the last component (symlink fixtures).
     assert path.is_absolute() and path.parent.resolve().is_relative_to(root), value
     return path
@@ -54,7 +56,7 @@ elif name == "codesign":
     if "--verify" in args:
         if mode == "stage_verify_fail" and str(target) != dest:
             fail()
-        if mode in ("verify_fail", "restore_move_fail", "restore_remove_fail") and str(target) == dest:
+        if mode in ("verify_fail", "restore_move_fail", "restore_remove_fail", "interrupt_during_restore") and str(target) == dest:
             fail()
     else:
         if mode == "sign_fail" or (mode == "nested_sign_fail" and target.suffix == ".xpc"):
@@ -77,8 +79,21 @@ elif name == "mv":
     source, target = map(safe, args)
     if mode == "backup_move_fail" and str(source) == dest:
         fail()
+    if mode == "backup_partial_fail" and str(source) == dest:
+        # Cross-filesystem mv copies first: a failed copy leaves a partial backup.
+        target.mkdir(parents=True)
+        (target / "partial").write_text("incomplete")
+        fail()
+    if mode == "interrupt_during_backup" and str(source) == dest:
+        # The signal arrives while mv is still running; mv finishes afterwards.
+        interrupt()
+        time.sleep(0.5)
     if mode == "restore_move_fail" and str(target) == dest:
         fail()
+    if mode == "interrupt_during_restore" and str(target) == dest:
+        # A second signal while rollback's mv runs must not start recovery again.
+        interrupt()
+        time.sleep(0.5)
     # Match mv's existing-directory semantics (important for collision tests).
     shutil.move(str(source), str(target))
     if mode == "interrupt_after_backup" and str(source) == dest:
@@ -150,9 +165,11 @@ class InstallerTests(unittest.TestCase):
             executable = shutil.which(command)
             self.assertIsNotNone(executable, command)
             (self.bin / command).symlink_to(executable)
+        # env, not the interpreter path: the kernel splits a shebang at spaces.
+        (self.bin / "python3").symlink_to(sys.executable)
         for command in ("security", "openssl", "codesign", "ditto", "mv", "rm", "date", "open", "pkill", "sleep", "find", "mkdir", "mktemp"):
             script = self.bin / command
-            script.write_text("#!" + sys.executable + "\n" + MOCK)
+            script.write_text("#!/usr/bin/env python3\n" + MOCK)
             script.chmod(0o755)
         self.env = {
             "PATH": str(self.bin), "HOME": str(self.root / "home"),
@@ -318,6 +335,26 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(any(name == "ditto" and args[-1] == str(self.dest) for name, args in self.events))
         self.assert_clean()
 
+    def test_interrupt_during_backup_move_restores_app(self):
+        # Recovery must wait for the running mv, not race it.
+        self.assertEqual(self.run_install("interrupt_during_backup", stop=True, launch=True).returncode, -signal.SIGTERM)
+        self.assert_old()
+        self.assertFalse(self.backup.exists())
+        self.assertEqual([args for name, args in self.events if name == "open"], [[str(self.dest)]])
+        self.assert_clean()
+
+    def test_partial_backup_keeps_original(self):
+        self.assertEqual(self.run_install("backup_partial_fail").returncode, 23)
+        self.assert_old()
+        self.assertTrue((self.backup / "partial").exists())
+        self.assert_clean()
+
+    def test_interrupt_during_restore_keeps_restored_app(self):
+        self.assertEqual(self.run_install("interrupt_during_restore").returncode, -signal.SIGTERM)
+        self.assert_old()
+        self.assertFalse(self.backup.exists())
+        self.assert_clean()
+
     def test_interrupt_during_copy_restores_app(self):
         self.assertEqual(self.run_install("interrupt_during_copy").returncode, -signal.SIGTERM)
         self.assert_old()
@@ -335,6 +372,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(Path(signed[-1]).name, "Ice.app")
         self.assertEqual({Path(x).suffix for x in signed[:-1]}, {".xpc", ".framework"})
         self.assert_clean()
+
+    def test_harness_rejects_parent_traversal(self):
+        escaped = self.root.parent / (self.root.name + "-escaped")
+        self.addCleanup(shutil.rmtree, escaped, ignore_errors=True)
+        sneaky = f"{self.root}/../{escaped.name}/../{self.root.name}/backup"
+        self.env["TEST_MODE"] = "success"
+        result = subprocess.run([str(self.bin / "mkdir"), "-p", sneaky], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(escaped.exists())
 
     def test_explicit_adhoc(self):
         self.env["ICE_ADHOC_SIGNING"] = "1"
