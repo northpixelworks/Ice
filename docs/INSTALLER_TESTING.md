@@ -26,15 +26,20 @@ to the host's read-only utility except when injecting an enumeration failure.
 The mocks `mkdir` and `mktemp` check every path (and `mktemp`'s created path)
 against the test root before delegating to the host utility; `mktemp` also
 requires an explicit template, since macOS ignores `TMPDIR` without one.
-Filesystem mocks reject paths outside the test root, and keychain import is
+Filesystem mocks reject paths outside the test root and any path with a `..`
+component (`mkdir -p` would create folders along the way before resolving it), and keychain import is
 simulated against a fake path. No real keychain is read or changed, no app is
 launched or stopped, and `/Applications/Ice.app` is never targeted. Fake private
 key files are created so failure-path cleanup can be asserted. The harness
-removes each fixture after the assertions, even when a test fails.
+removes each fixture after the assertions, even when a test fails. The mocks
+start with `#!/usr/bin/env python3` and the closed PATH links `python3` to the
+interpreter running the tests, so a Python path with spaces (e.g. a virtual
+environment in a folder named `Ice fork`) still works.
 
 ## Coverage and expected behavior
 
-The 25 black-box tests invoke the complete production installer:
+The 27 black-box tests invoke the complete production installer (plus one
+harness self-test for the `..` guard):
 
 | Scenario | Expected result |
 | --- | --- |
@@ -47,7 +52,8 @@ The 25 black-box tests invoke the complete production installer:
 | Failed first copy or first verification | Remove incomplete app when there was no previous installation; if removal fails, report the app path |
 | Backup collision: directory, file, dangling symlink | Abort before stop/move; leave old app and collision untouched |
 | Moving old app to backup fails, or creating the backup folder fails | Existing app retained; staging cleaned; failure status preserved |
-| SIGTERM (e.g. closed terminal) right after the backup move, or during the destination copy | Restore the old fixture; relaunch only if stopped; exit by the signal |
+| Backup move fails after writing a partial backup (cross-filesystem `mv` copies) | Existing app retained, never replaced by the partial backup |
+| SIGTERM (e.g. closed terminal) while the backup `mv` is still running, right after it, or during the destination copy | Wait for the running command, then restore the old fixture; relaunch only if stopped; exit by the signal |
 | Removing incomplete app fails during rollback | Leave backup recoverable at its original path; never move it into the partial app; clean staging |
 | Moving backup back fails | Keep backup at reported path; clean staging; preserve original error status |
 | Successful replacement | Sign nested bundles before containing app; verify before launch; retain old backup |
@@ -87,6 +93,15 @@ does not exercise installer recovery.
   failure before or during the move never deletes the installed app. The mocks
   send SIGTERM to the installer to cover this. A failed removal on a first
   install now names the app path instead of an empty backup path.
+- A Copilot review of that fix found two remaining gaps. (1) With only an EXIT
+  trap, bash ran recovery as soon as SIGTERM arrived, while the backup `mv` was
+  still running; recovery saw no backup yet and skipped, then `mv` moved the app
+  away. HUP, INT and TERM now have their own trap: bash runs it only after the
+  running command returns, then recovers, cleans up and exits by the same
+  signal. (2) The "backup exists" check let recovery replace an intact app with
+  a partial backup left by a failed cross-filesystem `mv`. Recovery now never
+  touches an app at the destination until `COPY_STARTED` marks that the copy of
+  the new app has begun.
 - Process substitution hid `find` failures. On this Linux execution host,
   `/dev/fd` process substitution also failed and nested bundles were skipped.
   Enumeration now writes a NUL-delimited list inside staging and checks `find`'s

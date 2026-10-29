@@ -11,6 +11,7 @@ KEY_TMPDIR=""
 BACKUP_PATH=""
 INSTALL_DONE=0
 INSTALL_STARTED=0
+COPY_STARTED=0
 ICE_STOPPED=0
 DESTINATION_APP_PATH="${ICE_INSTALL_APP_PATH:-/Applications/Ice.app}"
 [[ "$DESTINATION_APP_PATH" == *.app ]] || { echo "ERROR: ICE_INSTALL_APP_PATH must end in .app: $DESTINATION_APP_PATH"; exit 1; }
@@ -40,8 +41,9 @@ restore_backup_if_incomplete() {
   if [[ "$INSTALL_DONE" == "1" || "$INSTALL_STARTED" != "1" ]]; then
     return 0
   fi
-  # Interrupted or failed before the backup move: the installed app is untouched.
-  if [[ -n "$BACKUP_PATH" && ! -e "$BACKUP_PATH" && ! -L "$BACKUP_PATH" ]]; then
+  # Until the copy starts, an app at the destination is the untouched original
+  # (e.g. a failed backup move that left a partial backup): never replace it.
+  if [[ "$COPY_STARTED" != "1" ]] && [[ -e "$DESTINATION_APP_PATH" || -L "$DESTINATION_APP_PATH" ]]; then
     return 0
   fi
 
@@ -77,7 +79,20 @@ on_exit() {
   exit "$status"
 }
 
+# Bash runs a signal trap only after the running command returns, so recovery
+# never races a half-finished `mv` or `ditto`. Then exit by the same signal.
+on_signal() {
+  trap - EXIT HUP INT TERM
+  set +e
+  restore_backup_if_incomplete
+  cleanup_tmpdirs
+  kill -s "$1" "$$"
+}
+
 trap on_exit EXIT
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 
 # No -v: the self-signed certificate is never "trusted", but codesign can still
 # use it, and its fixed fingerprint keeps the Accessibility grant across builds.
@@ -339,6 +354,7 @@ if [[ -n "$backup_path" ]]; then
   echo "  Previous app preserved at $backup_path"
 fi
 INSTALL_STARTED=1
+COPY_STARTED=1
 ditto --norsrc --noextattr "$STAGED_APP_PATH" "$DESTINATION_APP_PATH"
 codesign --verify --deep --strict "$DESTINATION_APP_PATH"
 INSTALL_DONE=1
