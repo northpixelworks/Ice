@@ -90,6 +90,22 @@ elif name == "find":
     if mode == "find_fail":
         fail()
     sys.exit(subprocess.call([os.environ["TEST_REAL_FIND"], *args]))
+elif name == "mkdir":
+    for arg in args:
+        if not arg.startswith("-"):
+            safe(arg)
+    sys.exit(subprocess.call([os.environ["TEST_REAL_MKDIR"], *args]))
+elif name == "mktemp":
+    # Require an explicit template: without one, macOS ignores TMPDIR.
+    templates = [arg for arg in args if not arg.startswith("-")]
+    assert templates and "-t" not in args, args
+    for template in templates:
+        safe(template)
+    created = subprocess.run([os.environ["TEST_REAL_MKTEMP"], *args],
+                             check=True, text=True, stdout=subprocess.PIPE).stdout
+    for line in created.splitlines():
+        safe(line)
+    sys.stdout.write(created)
 elif name in ("open", "pkill", "sleep"):
     if name == "open":
         assert args == [dest]
@@ -119,17 +135,19 @@ class InstallerTests(unittest.TestCase):
         (self.source / "Contents" / "Helper.xpc").mkdir()
         (self.source / "Contents" / "Framework.framework").mkdir()
         # A closed PATH prevents fallback to real security/openssl/open/pkill.
-        for command in ("bash", "sed", "awk", "mkdir", "mktemp", "tail"):
+        for command in ("bash", "sed", "awk", "tail"):
             executable = shutil.which(command)
             self.assertIsNotNone(executable, command)
             (self.bin / command).symlink_to(executable)
-        for command in ("security", "openssl", "codesign", "ditto", "mv", "rm", "date", "open", "pkill", "sleep", "find"):
+        for command in ("security", "openssl", "codesign", "ditto", "mv", "rm", "date", "open", "pkill", "sleep", "find", "mkdir", "mktemp"):
             script = self.bin / command
             script.write_text("#!" + sys.executable + "\n" + MOCK)
             script.chmod(0o755)
         self.env = {
             "PATH": str(self.bin), "HOME": str(self.root / "home"),
             "TEST_REAL_FIND": shutil.which("find"),
+            "TEST_REAL_MKDIR": shutil.which("mkdir"),
+            "TEST_REAL_MKTEMP": shutil.which("mktemp"),
             "TMPDIR": str(self.tmp), "TEST_ROOT": str(self.root),
             "ICE_INSTALL_SOURCE": str(self.source),
             "ICE_INSTALL_APP_PATH": str(self.dest),

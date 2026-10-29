@@ -23,6 +23,9 @@ PATH is a closed directory containing only selected shell utilities and mocks.
 `security`, `openssl`, `codesign`, `ditto`, `open`, `pkill`, `sleep`, `date`, `mv`,
 and `rm` cannot fall through to the host's versions. The mock `find` delegates
 to the host's read-only utility except when injecting an enumeration failure.
+The mocks `mkdir` and `mktemp` check every path (and `mktemp`'s created path)
+against the test root before delegating to the host utility; `mktemp` also
+requires an explicit template, since macOS ignores `TMPDIR` without one.
 Filesystem mocks reject paths outside the test root, and keychain import is
 simulated against a fake path. No real keychain is read or changed, no app is
 launched or stopped, and `/Applications/Ice.app` is never targeted. Fake private

@@ -1,7 +1,9 @@
 name: Test installer failure handling
 
 on:
+  # Push only on main; pull_request covers PR branches, so each runs once.
   push:
+    branches: [main]
     paths:
       - build-and-install.sh
       - scripts/test-build-and-install.py
