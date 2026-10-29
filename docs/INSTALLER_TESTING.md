@@ -86,6 +86,13 @@ Bash 5.2.21; shell syntax and `git diff --check` passed. Real macOS/Xcode tests
 were not run in this Linux environment. The new macOS CI job must be checked
 separately; its presence is not evidence that it has already passed.
 
+macOS validation on 2026-10-29: all 21 tests passed on a Mac mini (Apple
+silicon), Python 3.14.10, system Bash 3.2.57; shell syntax and `git diff --check`
+passed. This needed one fix: macOS `mktemp -d` ignores `TMPDIR` without a
+template, so the installer now creates temporary directories via `make_tmpdir`
+with an explicit `${TMPDIR:-/tmp}/ice.XXXXXX` template. Still mocks only, not
+the real-Mac checks below.
+
 ## Additional checks on a real Mac
 
 Use a disposable macOS account or VM snapshot and a test copy of Ice. Keep the

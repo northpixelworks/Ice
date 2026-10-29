@@ -20,6 +20,11 @@ LOGIN_KEYCHAIN="$(
 )"
 LOGIN_KEYCHAIN="${LOGIN_KEYCHAIN:-${HOME}/Library/Keychains/login.keychain-db}"
 
+# Explicit template: macOS mktemp ignores TMPDIR without one.
+make_tmpdir() {
+  mktemp -d "${TMPDIR:-/tmp}/ice.XXXXXX"
+}
+
 cleanup_tmpdirs() {
   local dir
   for dir in "$ARTIFACT_TMPDIR" "$STAGING_TMPDIR" "$KEY_TMPDIR"; do
@@ -80,7 +85,7 @@ create_local_signing_identity() {
   fi
 
   # Tracked globally so the EXIT trap removes the unencrypted key on interrupts.
-  KEY_TMPDIR="$(mktemp -d)" || return 1
+  KEY_TMPDIR="$(make_tmpdir)" || return 1
 
   local key_path="$KEY_TMPDIR/ice-local-dev.key"
   local cert_path="$KEY_TMPDIR/ice-local-dev.crt"
@@ -182,7 +187,7 @@ sign_app_with_identity() {
 # Sign a staged copy before touching the installed app, so a signing failure
 # never leaves a half-signed Ice in place (mixed signatures fail to load Sparkle).
 stage_and_sign_app() {
-  STAGING_TMPDIR="$(mktemp -d)"
+  STAGING_TMPDIR="$(make_tmpdir)"
   STAGED_APP_PATH="$STAGING_TMPDIR/Ice.app"
   ditto --norsrc --noextattr "$INSTALL_APP_PATH" "$STAGED_APP_PATH"
   # stdout only: codesign's errors still reach the terminal.
@@ -244,7 +249,7 @@ download_artifact_app() {
     exit 1
   fi
 
-  ARTIFACT_TMPDIR="$(mktemp -d)"
+  ARTIFACT_TMPDIR="$(make_tmpdir)"
   local download_dir="$ARTIFACT_TMPDIR/download"
   local app_dir="$ARTIFACT_TMPDIR/app"
   mkdir -p "$download_dir" "$app_dir"
