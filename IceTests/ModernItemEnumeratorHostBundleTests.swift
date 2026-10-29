@@ -28,8 +28,12 @@ final class ModernItemEnumeratorHostBundleTests: XCTestCase {
         XCTAssertEqual(walkWithTimeout(helper), "com.example.host")
     }
 
-    func testRelativePathTerminatesWithoutBundle() {
-        XCTAssertNil(walkWithTimeout(URL(fileURLWithPath: "../../bin/wine", relativeTo: nil)))
+    /// `URL(fileURLWithPath:)` would resolve against the working directory;
+    /// `URL(string:)` keeps the path relative, which the walk must refuse.
+    func testRelativePathTerminatesWithoutBundle() throws {
+        let relative = try XCTUnwrap(URL(string: "../../bin/wine"))
+        XCTAssertFalse(relative.path.hasPrefix("/"))
+        XCTAssertNil(walkWithTimeout(relative))
     }
 
     /// Runs the walk on a background thread so a regression fails the test

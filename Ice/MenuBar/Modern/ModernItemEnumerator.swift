@@ -333,7 +333,9 @@ public actor ModernItemEnumerator {
     }
 
     /// Bundle id of the nearest .app enclosing `executable`, walking up the path.
-    static func enclosingAppBundleID(ofExecutable executable: URL) -> String? {
+    /// `..` is collapsed lexically, not through symlinks: for Wine's layout that
+    /// is the intended parent.
+    nonisolated static func enclosingAppBundleID(ofExecutable executable: URL) -> String? {
         // Standardize first: Wine reports paths like ".../lib/wine/../../bin/wine",
         // and deletingLastPathComponent() on a path ending in ".." appends
         // another "/.." instead of shortening it, so the walk never ends.
@@ -343,6 +345,8 @@ public actor ModernItemEnumerator {
                 return id
             }
             let parent = current.deletingLastPathComponent()
+            // Belt and braces: after standardizing, every step shortens the path,
+            // but if a future change lets a ".." through, stop instead of looping.
             guard parent.path.count < current.path.count else { break }
             url = parent
         }
