@@ -21,7 +21,7 @@ the caller's `ICE_*` settings. `ICE_INSTALL_SOURCE` bypasses builds/downloads;
 
 PATH is a closed directory containing only selected shell utilities and mocks.
 `security`, `openssl`, `codesign`, `ditto`, `open`, `pkill`, `sleep`, `date`, `mv`,
-and `rm` cannot fall through to the host's versions. The mock `find` delegates
+`rm`, `ln` and `readlink` cannot fall through to the host's versions. The mock `find` delegates
 to the host's read-only utility except when injecting an enumeration failure.
 The mocks `mkdir` and `mktemp` check every path (and `mktemp`'s created path)
 against the test root before delegating to the host utility; `mktemp` also
@@ -38,7 +38,7 @@ environment in a folder named `Ice fork`) still works.
 
 ## Coverage and expected behavior
 
-The 28 black-box tests invoke the complete production installer (plus one
+The 34 black-box tests invoke the complete production installer (plus one
 harness self-test for the `..` guard):
 
 | Scenario | Expected result |
@@ -59,6 +59,12 @@ harness self-test for the `..` guard):
 | Moving backup back fails | Keep backup at reported path; clean staging; preserve original error status |
 | Successful replacement | Sign nested bundles before containing app; verify before launch; retain old backup |
 | Explicit ad-hoc opt-in | Sign with `-`; do not create an identity |
+| Second installer while the first holds the lock (after the backup name is chosen, or during the copy) | Exit 75 before building, keychain or `/Applications` work; old app, partial copy and backup untouched; first installer finishes with exactly one backup |
+| Any normal, failed or signal exit | Lock released last, after recovery and cleanup |
+| Lock left by a SIGKILLed installer, or held by a live process | Exit 75; report PID and whether it runs; never remove someone else's lock |
+| Lock path occupied by a directory | Exit 1 without using or changing it |
+| Stale lock in a folder whose name has an apostrophe or spaces | Printed `rm` command is shell-escaped (`%q`) and removes the lock when pasted |
+| First install into a folder that does not exist yet | Create the folder, take the lock, install; no backup |
 
 The mocks deliberately return status 23 for injected command failures, allowing
 tests to detect an EXIT handler that accidentally replaces the original status.
@@ -108,6 +114,19 @@ does not exercise installer recovery.
   recovery a second time, which deleted the restored app with the backup already
   used up. Recovery now runs once; a signal arriving during it is only recorded,
   and the installer exits by that signal after recovery and cleanup finish.
+- Concurrent installers (2026-10-29): there was no lock. With the clock mocked
+  to one second, a second installer started while the first sat between the
+  backup-name check and its `mv` chose the same backup name and installed
+  completely; the first would then have moved the second's app into that
+  backup. Reproduced against the unlocked script by
+  `test_second_installer_refused_in_backup_name_window` (and the copy-window
+  test), not on a real Mac. The installer now takes a per-destination lock
+  first: a symlink `.<App>.app.install-lock` next to the app whose target is
+  `<PID>-<random>`. `ln -sn` creates it atomically together with its owner, so
+  no signal leaves an ownerless lock; ownership is checked by reading it back.
+  `finish` releases it after recovery and cleanup (once, also on HUP/INT/TERM),
+  and only if the token is its own. A refused installer exits 75 without
+  touching anything.
 - Process substitution hid `find` failures. On this Linux execution host,
   `/dev/fd` process substitution also failed and nested bundles were skipped.
   Enumeration now writes a NUL-delimited list inside staging and checks `find`'s
@@ -125,6 +144,20 @@ passed. This needed one fix: macOS `mktemp -d` ignores `TMPDIR` without a
 template, so the installer now creates temporary directories via `make_tmpdir`
 with an explicit `${TMPDIR:-/tmp}/ice.XXXXXX` template. Still mocks only, not
 the real-Mac checks below.
+
+Lock validation on 2026-10-29: all 35 tests (34 installer tests plus the
+harness self-test) passed on a MacBook (Apple silicon), Python 3.15.2, system
+Bash 3.2.57; the six concurrency/lock tests also passed five repeated runs.
+Before the fix, five of them failed against the unlocked script, reproducing
+the race in mocks. Shell syntax and `git diff --check` passed. Linux (Bash 5)
+was not run locally; check the CI job.
+
+Review follow-up on 2026-10-30 (Copilot on PR 6): the lock broke first installs
+into a missing folder (`ln` cannot create the lock there) and printed an `rm`
+command with unmatched quotes for paths containing `'`. The installer now
+creates the destination folder before locking and prints the command with
+`printf %q`. Both new tests failed against the previous script and pass now;
+all 37 tests passed on a MacBook (Apple silicon), system Bash 3.2.57.
 
 ## Additional checks on a real Mac
 
@@ -169,7 +202,26 @@ fingerprints, designated requirements, command results, and observed prompts.
   check control flow, not APFS/ditto metadata semantics.
 
 Recovery covers ordinary command failures reaching the EXIT trap. It is not a
-crash-safe transaction: SIGKILL, power loss, concurrent installers, external
-destination changes, and backup-name races after the preflight check are not
-covered. Run one installer per destination at a time. The harness does not
+crash-safe transaction. Remaining limits of recovery and the install lock:
+
+- **SIGKILL, crash, power loss:** no trap runs. The destination may be missing
+  (old app only in `Ice-backups.noindex`) or half-copied, staging/key temp
+  folders stay, and the lock stays (it is on disk, so it survives a reboot).
+  Every later installer refuses with exit 75 and prints the PID. Restore by
+  hand from the newest backup if needed, then remove the lock with the printed
+  `rm` command.
+- **Orphaned locks are never broken automatically.** `kill -0` is only a hint:
+  after a reboot the PID may belong to an unrelated process (reported as still
+  running), and another user's process looks "not running". Deciding that the
+  owner is gone stays with the user, because a wrong guess would reopen the race.
+- **Scope:** the lock only coordinates this installer for the same destination
+  folder and app name. Different destinations still share the keychain
+  identity creation and the `build.noindex` build folder, and Finder, other
+  tools or a manual copy ignore the lock. A different filesystem view of the
+  folder (e.g. a network mount without symlink support) is not covered.
+- **Same-second reinstall:** a sequential second install within the same second
+  still aborts on the backup collision check (unchanged, before stopping Ice).
+
+Concurrency tests use real processes held at file gates inside the mocks, so
+they are deterministic, but they still run against mocks and temp folders only. The harness does not
 validate the build/artifact download paths or replace the app's XCTest suite.

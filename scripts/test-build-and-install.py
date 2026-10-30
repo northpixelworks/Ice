@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Black-box installer tests: stdlib only, no Xcode, keychain or app launches."""
 import json
+import os
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 INSTALLER = Path(__file__).resolve().parents[1] / "build-and-install.sh"
@@ -20,7 +22,7 @@ root = p(os.environ["TEST_ROOT"]).resolve()
 name, args = p(sys.argv[0]).name, sys.argv[1:]
 mode = os.environ["TEST_MODE"]
 dest = os.environ["ICE_INSTALL_APP_PATH"]
-with (root / "events").open("a") as f:
+with p(os.environ.get("TEST_EVENTS", root / "events")).open("a") as f:
     f.write(json.dumps([name, args]) + "\n")
 def safe(value):
     path = p(value)
@@ -34,6 +36,16 @@ def fail():
 def interrupt():
     # Like a closed terminal: bash runs its EXIT trap once this command returns.
     os.kill(os.getppid(), signal.SIGTERM)
+def wait_at_gate():
+    # Hold this installer inside its critical section until the test releases it.
+    gate = root / "gate"
+    gate.mkdir(exist_ok=True)
+    (gate / "reached").write_text(str(os.getppid()))
+    deadline = time.time() + 15
+    while not (gate / "release").exists():
+        if time.time() > deadline:
+            fail()
+        time.sleep(0.02)
 if name == "security":
     if args[0] == "default-keychain":
         print('"' + str(root / "fake.keychain-db") + '"')
@@ -74,6 +86,10 @@ elif name == "ditto":
         (target / "partial").write_text("incomplete")
         interrupt()
         sys.exit(0)
+    if mode == "block_during_copy" and str(target) == dest:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "partial").write_text("incomplete")
+        wait_at_gate()
     shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
 elif name == "mv":
     source, target = map(safe, args)
@@ -116,6 +132,9 @@ elif name == "find":
     if mode == "find_fail":
         fail()
     sys.exit(subprocess.call([os.environ["TEST_REAL_FIND"], *args]))
+elif name in ("ln", "readlink"):
+    safe(args[-1])
+    sys.exit(subprocess.call([os.environ["TEST_REAL_" + name.upper()], *args]))
 elif name == "mkdir":
     for arg in args:
         if not arg.startswith("-"):
@@ -137,6 +156,9 @@ elif name in ("open", "pkill", "sleep"):
         assert args == [dest]
     if name == "pkill" and mode == "not_running":
         sys.exit(1)
+    if name == "sleep" and mode == "block_after_preflight":
+        # The backup name is chosen but the old app not yet moved: the race window.
+        wait_at_gate()
 else:
     raise AssertionError(name)
 '''
@@ -151,6 +173,8 @@ class InstallerTests(unittest.TestCase):
         self.dest = self.root / "Applications" / "Ice.app"
         self.backups = self.dest.parent / "Ice-backups.noindex"
         self.backup = self.backups / "Ice-20261029-120000.app"
+        self.lock = self.dest.parent / ".Ice.app.install-lock"
+        self.gate = self.root / "gate"
         self.bin = self.root / "bin"
         self.tmp = self.root / "tmp"
         for directory in (self.bin, self.tmp, self.dest.parent, self.root / "home"):
@@ -167,7 +191,7 @@ class InstallerTests(unittest.TestCase):
             (self.bin / command).symlink_to(executable)
         # env, not the interpreter path: the kernel splits a shebang at spaces.
         (self.bin / "python3").symlink_to(sys.executable)
-        for command in ("security", "openssl", "codesign", "ditto", "mv", "rm", "date", "open", "pkill", "sleep", "find", "mkdir", "mktemp"):
+        for command in ("security", "openssl", "codesign", "ditto", "mv", "rm", "date", "open", "pkill", "sleep", "find", "mkdir", "mktemp", "ln", "readlink"):
             script = self.bin / command
             script.write_text("#!/usr/bin/env python3\n" + MOCK)
             script.chmod(0o755)
@@ -176,6 +200,8 @@ class InstallerTests(unittest.TestCase):
             "TEST_REAL_FIND": shutil.which("find"),
             "TEST_REAL_MKDIR": shutil.which("mkdir"),
             "TEST_REAL_MKTEMP": shutil.which("mktemp"),
+            "TEST_REAL_LN": shutil.which("ln"),
+            "TEST_REAL_READLINK": shutil.which("readlink"),
             "TMPDIR": str(self.tmp), "TEST_ROOT": str(self.root),
             "ICE_INSTALL_SOURCE": str(self.source),
             "ICE_INSTALL_APP_PATH": str(self.dest),
@@ -183,7 +209,7 @@ class InstallerTests(unittest.TestCase):
         }
 
     def run_install(self, mode="success", *, stop=False, launch=False):
-        self.env.update(TEST_MODE=mode, ICE_INSTALL_NO_STOP="0" if stop else "1",
+        self.env.update(TEST_MODE=mode, TEST_EVENTS=str(self.root / "events"), ICE_INSTALL_NO_STOP="0" if stop else "1",
                         ICE_INSTALL_NO_LAUNCH="0" if launch else "1")
         self.result = subprocess.run([str(self.bin / "bash"), str(INSTALLER)],
                                      env=self.env, cwd=self.root, text=True,
@@ -196,6 +222,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(list(self.tmp.iterdir()), [], self.result.stdout)
         self.assertEqual((self.source / "Contents/version").read_text(), "new")
         self.assertFalse((self.source / "signed").exists())
+        # Every exit path, including signals, releases the install lock.
+        self.assertFalse(self.lock.is_symlink() or self.lock.exists(), self.result.stdout)
 
     def assert_old(self):
         self.assertEqual((self.dest / "Contents/version").read_text(), "old", self.result.stdout)
@@ -372,6 +400,159 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(Path(signed[-1]).name, "Ice.app")
         self.assertEqual({Path(x).suffix for x in signed[:-1]}, {".xpc", ".framework"})
         self.assert_clean()
+
+    # Concurrency: a second installer runs while the first is held at a gate.
+    def start_install(self, mode, label, *, stop=False):
+        env = dict(self.env, TEST_MODE=mode, TEST_EVENTS=str(self.root / f"events-{label}"),
+                   ICE_INSTALL_NO_STOP="0" if stop else "1")
+        process = subprocess.Popen([str(self.bin / "bash"), str(INSTALLER)], env=env, cwd=self.root,
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.addCleanup(self.stop_process, process)
+        return process
+
+    def stop_process(self, process):
+        self.release_gate()
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=20)
+
+    def wait_for_gate(self, process):
+        deadline = time.monotonic() + 15
+        while not (self.gate / "reached").exists():
+            if process.poll() is not None:
+                self.fail("first installer exited early:\n" + process.communicate()[0])
+            self.assertLess(time.monotonic(), deadline, "first installer never reached the gate")
+            time.sleep(0.02)
+
+    def release_gate(self):
+        self.gate.mkdir(exist_ok=True)
+        (self.gate / "release").touch()
+
+    def lock_owner_pid(self):
+        return int(os.readlink(self.lock).split("-")[0])
+
+    def assert_refused_untouched(self, status=75):
+        self.assertEqual(self.result.returncode, status, self.result.stdout)
+        self.assertIn("nothing was changed", self.result.stdout)
+        # The refused installer only read the keychain path and tried the lock.
+        self.assertLessEqual({name for name, _ in self.events}, {"security", "ln", "readlink"}, self.events)
+
+    def finish_first(self, first):
+        self.release_gate()
+        output = first.communicate(timeout=20)[0]
+        self.assertEqual(first.returncode, 0, output)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assertEqual((self.backup / "Contents/version").read_text(), "old")
+        self.assertEqual(list(self.backups.iterdir()), [self.backup])
+        self.assert_clean()
+
+    def test_second_installer_refused_in_backup_name_window(self):
+        # The first installer picked the backup name but has not moved the app yet.
+        # Without a lock the second picks the same name (the clock is mocked to
+        # one second) and both move or replace the same app.
+        first = self.start_install("block_after_preflight", "first", stop=True)
+        self.wait_for_gate(first)
+        self.run_install()
+        self.assert_refused_untouched()
+        self.assertIn(f"(PID {first.pid})", self.result.stdout)
+        self.assertIn("Wait for it to finish", self.result.stdout)
+        self.assert_old()
+        self.assertFalse(self.backups.exists())
+        self.assertEqual(self.lock_owner_pid(), first.pid)
+        self.finish_first(first)
+
+    def test_second_installer_refused_during_copy(self):
+        first = self.start_install("block_during_copy", "first")
+        self.wait_for_gate(first)
+        self.run_install()
+        self.assert_refused_untouched()
+        # Neither the half-copied destination nor the backup were touched.
+        self.assertEqual(sorted(x.name for x in self.dest.iterdir()), ["partial"])
+        self.assertEqual((self.backup / "Contents/version").read_text(), "old")
+        self.assertEqual(list(self.backups.iterdir()), [self.backup])
+        self.assertEqual(self.lock_owner_pid(), first.pid)
+        self.finish_first(first)
+
+    def test_lock_released_after_failure_allows_next_install(self):
+        self.assertEqual(self.run_install("copy_fail").returncode, 23)
+        self.assert_old()
+        self.assert_clean()
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assert_clean()
+
+    def test_sigkill_leaves_stale_lock_that_is_reported_not_broken(self):
+        # SIGKILL runs no trap: the lock stays, and later installers refuse until
+        # someone removes it; they never guess that the owner is gone.
+        first = self.start_install("block_after_preflight", "first", stop=True)
+        self.wait_for_gate(first)
+        first.kill()
+        first.communicate(timeout=20)
+        self.release_gate()
+        self.run_install()
+        self.assert_refused_untouched()
+        self.assertIn(f"PID {first.pid} is not running", self.result.stdout)
+        self.assertEqual(self.lock_owner_pid(), first.pid)
+        self.assert_old()
+        self.assertFalse(self.backups.exists())
+        # The killed installer's staging copy is left behind as well.
+        leftovers = list(self.tmp.iterdir())
+        self.assertEqual(len(leftovers), 1)
+        self.remove_lock_as_printed()
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual(list(self.tmp.iterdir()), leftovers)
+        self.assertFalse(self.lock.is_symlink())
+
+    def remove_lock_as_printed(self):
+        # Run the printed recovery command with the real rm, as a user would paste it.
+        command = self.result.stdout.split("remove the lock: ", 1)[1].splitlines()[0]
+        subprocess.run([os.path.realpath(self.bin / "bash"), "-c", command], check=True)
+        self.assertFalse(self.lock.is_symlink() or self.lock.exists(), command)
+
+    def test_stale_lock_command_quotes_path(self):
+        # An apostrophe in the folder must not break the printed rm command.
+        folder = self.root / "Mario's Apps"
+        self.dest.parent.rename(folder)
+        self.dest, self.lock = folder / "Ice.app", folder / ".Ice.app.install-lock"
+        self.backups = folder / "Ice-backups.noindex"
+        self.env["ICE_INSTALL_APP_PATH"] = str(self.dest)
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        os.symlink(f"{dead.pid}-1", self.lock)
+        self.run_install()
+        self.assert_refused_untouched()
+        self.assertIn(f"PID {dead.pid} is not running", self.result.stdout)
+        self.remove_lock_as_printed()
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assert_clean()
+
+    def test_first_install_creates_missing_destination_folder(self):
+        # e.g. ICE_INSTALL_APP_PATH=~/Applications/Ice.app on a fresh account.
+        shutil.rmtree(self.dest.parent)
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assertFalse(self.backups.exists())
+        self.assert_clean()
+
+    def test_lock_owned_by_live_process_is_respected(self):
+        # A matching PID with another token is still someone else's lock.
+        os.symlink(f"{os.getpid()}-1", self.lock)
+        self.run_install()
+        self.assert_refused_untouched()
+        self.assertIn("Wait for it to finish", self.result.stdout)
+        self.assertEqual(os.readlink(self.lock), f"{os.getpid()}-1")
+        self.assert_old()
+        self.assertFalse(self.backups.exists())
+
+    def test_occupied_lock_path_is_not_used(self):
+        # ln would create its link inside a directory; refuse instead.
+        self.lock.mkdir()
+        self.run_install()
+        self.assert_refused_untouched(status=1)
+        self.assertIn("occupied", self.result.stdout)
+        self.assertEqual(list(self.lock.iterdir()), [])
+        self.assert_old()
 
     def test_harness_rejects_parent_traversal(self):
         escaped = self.root.parent / (self.root.name + "-escaped")

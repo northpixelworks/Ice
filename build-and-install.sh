@@ -16,6 +16,16 @@ PENDING_SIGNAL=""
 ICE_STOPPED=0
 DESTINATION_APP_PATH="${ICE_INSTALL_APP_PATH:-/Applications/Ice.app}"
 [[ "$DESTINATION_APP_PATH" == *.app ]] || { echo "ERROR: ICE_INSTALL_APP_PATH must end in .app: $DESTINATION_APP_PATH"; exit 1; }
+# One installer per destination. The lock sits in the app's folder, so every
+# spelling of that folder (symlinks, case on APFS) reaches the same lock.
+if [[ "$DESTINATION_APP_PATH" == */* ]]; then
+  INSTALL_LOCK="${DESTINATION_APP_PATH%/*}/.${DESTINATION_APP_PATH##*/}.install-lock"
+else
+  INSTALL_LOCK=".${DESTINATION_APP_PATH}.install-lock"
+fi
+# PID plus a random part: a stale lock from an earlier process that had our PID
+# is never mistaken for ours.
+LOCK_TOKEN="$$-$RANDOM$RANDOM"
 LOGIN_KEYCHAIN="$(
   security default-keychain -d user 2>/dev/null |
     sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' || true
@@ -34,6 +44,55 @@ cleanup_tmpdirs() {
       rm -rf "$dir"
     fi
   done
+}
+
+lock_owner() {
+  readlink "$INSTALL_LOCK" 2>/dev/null || true
+}
+
+# A symlink is created atomically together with its owner token, so no signal
+# can leave an ownerless lock (mkdir plus a PID file would have that window).
+# Ownership is read back instead of trusting ln's status.
+acquire_install_lock() {
+  # A first install may target a folder that does not exist yet (~/Applications).
+  if [[ "$INSTALL_LOCK" == */* && ! -d "${INSTALL_LOCK%/*}" ]]; then
+    mkdir -p "${INSTALL_LOCK%/*}" || { echo "ERROR: Could not create the destination folder: ${INSTALL_LOCK%/*}"; exit 1; }
+  fi
+  if [[ -e "$INSTALL_LOCK" && ! -L "$INSTALL_LOCK" ]]; then
+    # ln would create its link inside a directory here.
+    echo "ERROR: Install lock path is occupied by something else; nothing was changed: $INSTALL_LOCK"
+    exit 1
+  fi
+  ln -sn "$LOCK_TOKEN" "$INSTALL_LOCK" 2>/dev/null || true
+  local owner pid
+  owner="$(lock_owner)"
+  if [[ "$owner" == "$LOCK_TOKEN" ]]; then
+    return 0
+  fi
+  if [[ -z "$owner" ]]; then
+    echo "ERROR: Could not create the install lock; nothing was changed: $INSTALL_LOCK"
+    exit 1
+  fi
+
+  # Never break someone else's lock: a guess about a dead owner could let two
+  # installers move the same app.
+  pid="${owner%%-*}"
+  echo "ERROR: Another install into $DESTINATION_APP_PATH holds $INSTALL_LOCK (PID $pid); nothing was changed."
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "  Wait for it to finish, then run the installer again."
+  else
+    echo "  PID $pid is not running (or belongs to another user): the lock is probably left over from a killed installer, crash or power loss."
+    # %q keeps the command usable for paths with quotes or spaces.
+    printf '  Make sure no installer is running and check %s and its backups, then remove the lock: rm %q\n' "$DESTINATION_APP_PATH" "$INSTALL_LOCK"
+  fi
+  exit 75
+}
+
+# Only the owner removes the lock; a refused installer leaves it alone.
+release_install_lock() {
+  if [[ "$(lock_owner)" == "$LOCK_TOKEN" ]]; then
+    rm -f "$INSTALL_LOCK"
+  fi
 }
 
 # If anything fails after the installed app was moved to its backup, put the
@@ -80,6 +139,8 @@ finish() {
   set +e
   restore_backup_if_incomplete
   cleanup_tmpdirs
+  # Last, so no other installer starts while recovery is still running.
+  release_install_lock
   if [[ -n "$PENDING_SIGNAL" ]]; then
     trap - "$PENDING_SIGNAL"
     kill -s "$PENDING_SIGNAL" "$$"
@@ -104,6 +165,9 @@ trap on_exit EXIT
 trap 'on_signal HUP' HUP
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
+
+# Lock before building or touching the keychain or the installed app.
+acquire_install_lock
 
 # No -v: the self-signed certificate is never "trusted", but codesign can still
 # use it, and its fixed fingerprint keeps the Accessibility grant across builds.
