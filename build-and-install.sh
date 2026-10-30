@@ -54,6 +54,10 @@ lock_owner() {
 # can leave an ownerless lock (mkdir plus a PID file would have that window).
 # Ownership is read back instead of trusting ln's status.
 acquire_install_lock() {
+  # A first install may target a folder that does not exist yet (~/Applications).
+  if [[ "$INSTALL_LOCK" == */* && ! -d "${INSTALL_LOCK%/*}" ]]; then
+    mkdir -p "${INSTALL_LOCK%/*}" || { echo "ERROR: Could not create the destination folder: ${INSTALL_LOCK%/*}"; exit 1; }
+  fi
   if [[ -e "$INSTALL_LOCK" && ! -L "$INSTALL_LOCK" ]]; then
     # ln would create its link inside a directory here.
     echo "ERROR: Install lock path is occupied by something else; nothing was changed: $INSTALL_LOCK"
@@ -78,7 +82,8 @@ acquire_install_lock() {
     echo "  Wait for it to finish, then run the installer again."
   else
     echo "  PID $pid is not running (or belongs to another user): the lock is probably left over from a killed installer, crash or power loss."
-    echo "  Make sure no installer is running and check $DESTINATION_APP_PATH and its backups, then remove the lock: rm '$INSTALL_LOCK'"
+    # %q keeps the command usable for paths with quotes or spaces.
+    printf '  Make sure no installer is running and check %s and its backups, then remove the lock: rm %q\n' "$DESTINATION_APP_PATH" "$INSTALL_LOCK"
   fi
   exit 75
 }

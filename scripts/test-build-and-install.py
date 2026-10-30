@@ -492,17 +492,48 @@ class InstallerTests(unittest.TestCase):
         self.run_install()
         self.assert_refused_untouched()
         self.assertIn(f"PID {first.pid} is not running", self.result.stdout)
-        self.assertIn(f"rm '{self.lock}'", self.result.stdout)
         self.assertEqual(self.lock_owner_pid(), first.pid)
         self.assert_old()
         self.assertFalse(self.backups.exists())
         # The killed installer's staging copy is left behind as well.
         leftovers = list(self.tmp.iterdir())
         self.assertEqual(len(leftovers), 1)
-        self.lock.unlink()
+        self.remove_lock_as_printed()
         self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
         self.assertEqual(list(self.tmp.iterdir()), leftovers)
         self.assertFalse(self.lock.is_symlink())
+
+    def remove_lock_as_printed(self):
+        # Run the printed recovery command with the real rm, as a user would paste it.
+        command = self.result.stdout.split("remove the lock: ", 1)[1].splitlines()[0]
+        subprocess.run([os.path.realpath(self.bin / "bash"), "-c", command], check=True)
+        self.assertFalse(self.lock.is_symlink() or self.lock.exists(), command)
+
+    def test_stale_lock_command_quotes_path(self):
+        # An apostrophe in the folder must not break the printed rm command.
+        folder = self.root / "Mario's Apps"
+        self.dest.parent.rename(folder)
+        self.dest, self.lock = folder / "Ice.app", folder / ".Ice.app.install-lock"
+        self.backups = folder / "Ice-backups.noindex"
+        self.env["ICE_INSTALL_APP_PATH"] = str(self.dest)
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        os.symlink(f"{dead.pid}-1", self.lock)
+        self.run_install()
+        self.assert_refused_untouched()
+        self.assertIn(f"PID {dead.pid} is not running", self.result.stdout)
+        self.remove_lock_as_printed()
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assert_clean()
+
+    def test_first_install_creates_missing_destination_folder(self):
+        # e.g. ICE_INSTALL_APP_PATH=~/Applications/Ice.app on a fresh account.
+        shutil.rmtree(self.dest.parent)
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assertFalse(self.backups.exists())
+        self.assert_clean()
 
     def test_lock_owned_by_live_process_is_respected(self):
         # A matching PID with another token is still someone else's lock.

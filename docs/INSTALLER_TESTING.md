@@ -63,6 +63,8 @@ harness self-test for the `..` guard):
 | Any normal, failed or signal exit | Lock released last, after recovery and cleanup |
 | Lock left by a SIGKILLed installer, or held by a live process | Exit 75; report PID and whether it runs; never remove someone else's lock |
 | Lock path occupied by a directory | Exit 1 without using or changing it |
+| Stale lock in a folder whose name has an apostrophe or spaces | Printed `rm` command is shell-escaped (`%q`) and removes the lock when pasted |
+| First install into a folder that does not exist yet | Create the folder, take the lock, install; no backup |
 
 The mocks deliberately return status 23 for injected command failures, allowing
 tests to detect an EXIT handler that accidentally replaces the original status.
@@ -149,6 +151,13 @@ Bash 3.2.57; the six concurrency/lock tests also passed five repeated runs.
 Before the fix, five of them failed against the unlocked script, reproducing
 the race in mocks. Shell syntax and `git diff --check` passed. Linux (Bash 5)
 was not run locally; check the CI job.
+
+Review follow-up on 2026-10-30 (Copilot on PR 6): the lock broke first installs
+into a missing folder (`ln` cannot create the lock there) and printed an `rm`
+command with unmatched quotes for paths containing `'`. The installer now
+creates the destination folder before locking and prints the command with
+`printf %q`. Both new tests failed against the previous script and pass now;
+all 37 tests passed on a MacBook (Apple silicon), system Bash 3.2.57.
 
 ## Additional checks on a real Mac
 
