@@ -403,12 +403,19 @@ resolve_signing_identity
 echo "=== Signing ==="
 stage_and_sign_app
 
-# Pick the backup name before stopping Ice, so a name clash exits with Ice untouched.
+# Pick the backup name before stopping Ice. Two installs in the same second get
+# -2, -3, ... instead of failing; an existing entry is never touched or reused.
 backup_dir="${DESTINATION_APP_PATH%.app}-backups.noindex"
 backup_path=""
 if [[ -e "$DESTINATION_APP_PATH" || -L "$DESTINATION_APP_PATH" ]]; then
-  backup_path="$backup_dir/Ice-$(date +%Y%m%d-%H%M%S).app"
-  [[ ! -e "$backup_path" && ! -L "$backup_path" ]] || { echo "ERROR: Backup already exists: $backup_path"; exit 1; }
+  backup_stem="$backup_dir/Ice-$(date +%Y%m%d-%H%M%S)"
+  backup_path="$backup_stem.app"
+  backup_suffix=1
+  while [[ -e "$backup_path" || -L "$backup_path" ]]; do
+    backup_suffix=$((backup_suffix + 1))
+    (( backup_suffix <= 99 )) || { echo "ERROR: No free backup name for $backup_stem.app; nothing was changed."; exit 1; }
+    backup_path="$backup_stem-$backup_suffix.app"
+  done
 fi
 
 if [[ "${ICE_INSTALL_NO_STOP:-0}" != "1" ]]; then

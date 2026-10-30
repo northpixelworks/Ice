@@ -277,31 +277,49 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(any(name == "open" for name, _ in self.events))
         self.assert_clean()
 
+    def assert_installed_beside_collision(self, name="Ice-20261029-120000-2.app"):
+        self.assertEqual(self.result.returncode, 0, self.result.stdout)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assertEqual((self.backups / name / "Contents/version").read_text(), "old")
+        self.assert_clean()
+
     def test_collision_directory(self):
         self.backup.mkdir(parents=True)
         (self.backup / "sentinel").write_text("keep")
-        self.assertNotEqual(self.run_install(stop=True, launch=True).returncode, 0)
-        self.assert_old()
+        self.run_install(stop=True, launch=True)
+        self.assertEqual(sorted(p.name for p in self.backup.iterdir()), ["sentinel"])
         self.assertEqual((self.backup / "sentinel").read_text(), "keep")
-        self.assertFalse(any(name in ("pkill", "open", "mv") for name, _ in self.events))
-        self.assert_clean()
+        self.assert_installed_beside_collision()
 
     def test_collision_dangling_symlink(self):
         self.backups.mkdir()
         self.backup.symlink_to(self.root / "missing")
-        self.assertNotEqual(self.run_install(stop=True, launch=True).returncode, 0)
-        self.assert_old()
+        self.run_install(stop=True, launch=True)
         self.assertTrue(self.backup.is_symlink())
-        self.assertFalse(any(name in ("pkill", "open", "mv") for name, _ in self.events))
-        self.assert_clean()
+        self.assert_installed_beside_collision()
 
     def test_collision_regular_file(self):
         self.backups.mkdir()
         self.backup.write_text("keep")
-        self.assertNotEqual(self.run_install(stop=True).returncode, 0)
-        self.assert_old()
+        self.run_install(stop=True)
         self.assertEqual(self.backup.read_text(), "keep")
-        self.assertFalse(any(name == "pkill" for name, _ in self.events))
+        self.assert_installed_beside_collision()
+
+    def test_collision_skips_every_taken_suffix(self):
+        self.backups.mkdir()
+        self.backup.write_text("keep")
+        (self.backups / "Ice-20261029-120000-2.app").write_text("keep")
+        self.run_install(stop=True)
+        self.assert_installed_beside_collision("Ice-20261029-120000-3.app")
+
+    def test_no_free_backup_name_aborts_before_stop(self):
+        self.backups.mkdir()
+        self.backup.write_text("keep")
+        for n in range(2, 100):
+            (self.backups / f"Ice-20261029-120000-{n}.app").write_text("keep")
+        self.assertNotEqual(self.run_install(stop=True, launch=True).returncode, 0)
+        self.assert_old()
+        self.assertFalse(any(name in ("pkill", "open", "mv") for name, _ in self.events))
         self.assert_clean()
 
     def test_failed_first_install_removes_partial_app(self):
