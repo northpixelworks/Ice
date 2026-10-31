@@ -292,6 +292,8 @@ private final class FakeModernWorkspace {
     private(set) var activatedAllowlists: [Set<String>] = []
     private(set) var invalidations = 0
     private let changes = PassthroughSubject<Void, Never>()
+    var displayBounds = [CGRect(x: 0, y: 0, width: 1000, height: 800)]
+    let dragger = FakeDragger()
 
     init(applications: [ModernRunningApplication] = []) {
         self.applications = applications
@@ -322,7 +324,10 @@ private final class FakeModernWorkspace {
             invalidateAssertion: { [self] assertion in
                 if assertion != nil { invalidations += 1 }
             },
-            startsWatchdog: false
+            startsWatchdog: false,
+            displayBounds: { [self] in displayBounds },
+            dragItem: { [dragger] in await dragger.drag(from: $0, to: $1) },
+            moveSettleDelay: .zero
         )
     }
 }
@@ -729,5 +734,146 @@ extension ModernVisibilityLifecycleTests {
         let failed = try await waitUntil(timeout: 2) { workspace.invalidations == 1 }
         XCTAssertTrue(failed, "A concealed item still visible after the settle window fails verification")
         XCTAssertGreaterThanOrEqual(ProcessInfo.processInfo.systemUptime - activatedAt, 2.9)
+    }
+}
+
+/// Records Command-drags instead of posting real mouse events.
+private actor FakeDragger {
+    private(set) var drags: [[CGPoint]] = []
+    private var succeeds = true
+    private var onDrag: (@Sendable () async -> Void)?
+
+    func configure(succeeds: Bool = true, onDrag: (@Sendable () async -> Void)? = nil) {
+        self.succeeds = succeeds
+        self.onDrag = onDrag
+    }
+
+    func drag(from: CGPoint, to: CGPoint) async -> Bool {
+        drags.append([from, to])
+        await onDrag?()
+        return succeeds
+    }
+}
+
+extension ModernVisibilityLifecycleTests {
+    /// C4: `move()` resolves both items from a fresh snapshot, drags onto the
+    /// target's near edge, and takes the new order from merged discovery.
+    @MainActor
+    private func makeMoveManager(
+        _ workspace: FakeModernWorkspace,
+        _ script: ScriptedSnapshots
+    ) async -> ModernMenuBarManager {
+        let manager = ModernMenuBarManager(
+            snapshotOverride: { await script.snapshot() },
+            environment: workspace.environment
+        )
+        await manager.refresh()
+        return manager
+    }
+
+    @MainActor
+    func testMoveDragsOntoTargetEdgeAndAdoptsMergedOrder() async throws {
+        let workspace = FakeModernWorkspace()
+        let script = ScriptedSnapshots(ModernMenuBarSnapshot(
+            items: [item("example.a"), item("example.b", x: 30), item("example.c", x: 60)],
+            isReadable: true
+        ))
+        let manager = await makeMoveManager(workspace, script)
+        XCTAssertEqual(manager.items.map(\.id.bundleID), ["example.a", "example.b", "example.c"])
+
+        let moved = ModernMenuBarSnapshot(
+            items: [item("example.c"), item("example.a", x: 30), item("example.b", x: 60)],
+            isReadable: true
+        )
+        await workspace.dragger.configure { await script.set(moved) }
+        await manager.move(item("example.c").id, before: item("example.a").id)
+
+        // Leftward: from c's centre to one point left of a's leading edge, at the same height.
+        let leftward = await workspace.dragger.drags
+        XCTAssertEqual(leftward, [[CGPoint(x: 71, y: 11), CGPoint(x: -1, y: 11)]])
+        XCTAssertNil(manager.errorMessage)
+        XCTAssertEqual(manager.items.map(\.id.bundleID), ["example.c", "example.a", "example.b"])
+        XCTAssertFalse(manager.isMoving)
+
+        // Rightward: one point past the target's leading edge.
+        await workspace.dragger.configure()
+        await manager.move(item("example.c").id, before: item("example.b").id)
+        let rightward = await workspace.dragger.drags.last
+        XCTAssertEqual(rightward, [CGPoint(x: 11, y: 11), CGPoint(x: 61, y: 11)])
+        XCTAssertEqual(manager.errorMessage, "macOS did not accept this move. The item may be fixed in place.")
+    }
+
+    @MainActor
+    func testMoveKeepsKnownItemsWhenSnapshotAfterDragIsEmptyOrUnreadable() async throws {
+        let before = [item("example.a"), item("example.b", x: 30)]
+        for after in [ModernMenuBarSnapshot(items: [], isReadable: true), ModernMenuBarSnapshot.unreadable] {
+            let workspace = FakeModernWorkspace()
+            let script = ScriptedSnapshots(ModernMenuBarSnapshot(items: before, isReadable: true))
+            let manager = await makeMoveManager(workspace, script)
+            await workspace.dragger.configure { await script.set(after) }
+            await manager.move(item("example.b").id, before: item("example.a").id)
+
+            let drags = await workspace.dragger.drags
+            XCTAssertEqual(drags.count, 1)
+            XCTAssertEqual(manager.items, before, "An empty or unreadable snapshot must not clear the known items")
+            XCTAssertEqual(manager.errorMessage, "macOS did not accept this move. The item may be fixed in place.")
+        }
+    }
+
+    @MainActor
+    func testMoveDoesNotDragOutsideOneVisibleMenuBar() async throws {
+        let cases: [([CGRect], String)] = [
+            ([], "Show both items in the same menu bar before moving them. Expand the macOS overflow menu if needed."),
+            ([CGRect(x: 0, y: 0, width: 40, height: 800), CGRect(x: 40, y: 0, width: 960, height: 800)],
+             "Show both items in the same menu bar before moving them. Expand the macOS overflow menu if needed."),
+            // Items more than 80 points below the display top are not in its menu bar.
+            ([CGRect(x: 0, y: -200, width: 1000, height: 1000)], "The menu bar is not currently visible."),
+        ]
+        for (bounds, message) in cases {
+            let workspace = FakeModernWorkspace()
+            workspace.displayBounds = bounds
+            let script = ScriptedSnapshots(ModernMenuBarSnapshot(
+                items: [item("example.a"), item("example.b", x: 60)],
+                isReadable: true
+            ))
+            let manager = await makeMoveManager(workspace, script)
+            await manager.move(item("example.b").id, before: item("example.a").id)
+
+            let drags = await workspace.dragger.drags
+            XCTAssertEqual(drags, [], "No mouse events for \(bounds)")
+            XCTAssertEqual(manager.errorMessage, message)
+            XCTAssertFalse(manager.isMoving)
+        }
+    }
+
+    @MainActor
+    func testFailedDragReportsPermissionAndKeepsItems() async throws {
+        let workspace = FakeModernWorkspace()
+        let before = [item("example.a"), item("example.b", x: 30)]
+        let script = ScriptedSnapshots(ModernMenuBarSnapshot(items: before, isReadable: true))
+        let manager = await makeMoveManager(workspace, script)
+        await workspace.dragger.configure(succeeds: false)
+        await manager.move(item("example.b").id, before: item("example.a").id)
+
+        XCTAssertEqual(manager.errorMessage, "Could not move the item. Check Ice’s Accessibility permission.")
+        XCTAssertEqual(manager.items, before)
+        XCTAssertFalse(manager.isMoving)
+    }
+
+    @MainActor
+    func testDropIntoAnotherSectionAssignsWithoutDragging() async throws {
+        let workspace = FakeModernWorkspace()
+        workspace.layout.assignments["example.a"] = .hidden
+        let script = ScriptedSnapshots(ModernMenuBarSnapshot(
+            items: [item("example.a"), item("example.b", x: 30)],
+            isReadable: true
+        ))
+        let manager = await makeMoveManager(workspace, script)
+        await manager.move(item("example.b").id, before: item("example.a").id)
+
+        let drags = await workspace.dragger.drags
+        XCTAssertEqual(drags, [])
+        XCTAssertEqual(manager.layout.section(for: item("example.b").id), .hidden)
+        manager.stop()
     }
 }

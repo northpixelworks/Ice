@@ -21,6 +21,12 @@ struct ModernMenuBarEnvironment {
     var activateAssertion: (_ configuration: AnyObject, _ completion: @escaping (Error?) -> Void) -> AnyObject?
     var invalidateAssertion: (AnyObject?) -> Void
     var startsWatchdog: Bool
+    /// Bounds of every connected display, to find the menu bar a move happens in.
+    var displayBounds: () -> [CGRect]
+    /// Posts the Command-drag that moves a status item; false if it could not.
+    var dragItem: @Sendable (_ from: CGPoint, _ to: CGPoint) async -> Bool
+    /// How long macOS gets to settle a dragged item before the order is checked.
+    var moveSettleDelay: Duration
 
     static var live: Self {
         Self(
@@ -47,7 +53,10 @@ struct ModernMenuBarEnvironment {
             makeConfiguration: { iceModern_makeConfiguration($0, $1) as AnyObject? },
             activateAssertion: { iceModern_activateAssertion($0, $1) as AnyObject? },
             invalidateAssertion: { iceModern_invalidateAssertion($0) },
-            startsWatchdog: true
+            startsWatchdog: true,
+            displayBounds: { NSScreen.screens.map { CGDisplayBounds($0.displayID) } },
+            dragItem: { await ModernMenuBarMover.drag(from: $0, to: $1) },
+            moveSettleDelay: .milliseconds(400)
         )
     }
 }
@@ -652,13 +661,12 @@ final class ModernMenuBarManager: ObservableObject {
             if refreshPending { requestRefresh() }
         }
         errorMessage = nil
-        let fresh = await enumerator.snapshotItems()
+        let fresh = await takeSnapshot().items
             .sorted { $0.frame.minX < $1.frame.minX }
         guard let item = fresh.first(where: { $0.id == id }),
               let target = fresh.first(where: { $0.id == targetID }),
-              let display = NSScreen.screens.first(where: {
-                  let bounds = CGDisplayBounds($0.displayID)
-                  return bounds.contains(item.frame) && bounds.contains(target.frame)
+              let displayBounds = environment.displayBounds().first(where: {
+                  $0.contains(item.frame) && $0.contains(target.frame)
               }),
               item.frame.width > 0, target.frame.width > 0,
               abs(item.frame.midY - target.frame.midY) < 3
@@ -666,7 +674,6 @@ final class ModernMenuBarManager: ObservableObject {
             errorMessage = "Show both items in the same menu bar before moving them. Expand the macOS overflow menu if needed."
             return
         }
-        let displayBounds = CGDisplayBounds(display.displayID)
         guard item.frame.minY >= displayBounds.minY, item.frame.maxY <= displayBounds.minY + 80 else {
             errorMessage = "The menu bar is not currently visible."
             return
@@ -674,12 +681,12 @@ final class ModernMenuBarManager: ObservableObject {
         let destinationX = item.frame.minX < target.frame.minX ? target.frame.minX + 1 : target.frame.minX - 1
         let from = CGPoint(x: item.frame.midX, y: item.frame.midY)
         let to = CGPoint(x: destinationX, y: target.frame.midY)
-        guard await ModernMenuBarMover.drag(from: from, to: to) else {
+        guard await environment.dragItem(from, to) else {
             errorMessage = "Could not move the item. Check Ice’s Accessibility permission."
             return
         }
-        try? await Task.sleep(for: .milliseconds(400))
-        let snapshot = await enumerator.snapshot()
+        try? await Task.sleep(for: environment.moveSettleDelay)
+        let snapshot = await takeSnapshot()
         let after = snapshot.items.sorted { $0.frame.minX < $1.frame.minX }
         updateKnownItems(from: snapshot)
         let beforeVerification = fresh.map { ModernMoveVerificationItem(id: $0.id, midX: $0.frame.midX) }
