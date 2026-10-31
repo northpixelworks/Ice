@@ -164,6 +164,16 @@ creates the destination folder before locking and prints the command with
 `printf %q`. Both new tests failed against the previous script and pass now;
 all 37 tests passed on a MacBook (Apple silicon), system Bash 3.2.57.
 
+Backup-name fix on 2026-10-30 (`7e17985`): a taken backup name now gets the next
+free `-2` ... `-99` suffix instead of aborting. The three collision tests were
+rewritten for that and two added (suffix skipping, no free name); all 39 tests
+passed on a MacBook (Apple silicon), system Bash 3.2.57.
+
+Backup pruning on 2026-10-30 (`e767621`): seven tests added for keeping the
+newest 5 backups; all 46 tests passed on a MacBook (Apple silicon), Python
+3.15.2, system Bash 3.2.57. A Codex review of both commits found no issues.
+Linux (Bash 5) was not run locally; check the CI job.
+
 ## Additional checks on a real Mac
 
 Use a disposable macOS account or VM snapshot and a test copy of Ice. Keep the
@@ -224,8 +234,13 @@ crash-safe transaction. Remaining limits of recovery and the install lock:
   identity creation and the `build.noindex` build folder, and Finder, other
   tools or a manual copy ignore the lock. A different filesystem view of the
   folder (e.g. a network mount without symlink support) is not covered.
-- **Same-second reinstall:** a sequential second install within the same second
-  still aborts on the backup collision check (unchanged, before stopping Ice).
+- **Same-second reinstall:** a second install within the same second uses the
+  next free backup name (`-2`, `-3`, ...). It aborts, before stopping Ice, only
+  if every name up to `-99` for that second is taken.
+- **Backup count:** after a verified install only the newest 5 backups stay
+  (`ICE_KEEP_BACKUPS` sets another number). Pruning ignores anything not named
+  like an installer backup, so hand-made copies in `Ice-backups.noindex` are
+  neither counted nor removed.
 
 Concurrency tests use real processes held at file gates inside the mocks, so
 they are deterministic, but they still run against mocks and temp folders only. The harness does not
