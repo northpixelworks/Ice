@@ -121,6 +121,8 @@ elif name == "rm":
         target = safe(arg)
         if mode == "restore_remove_fail" and str(target) == dest:
             fail()
+        if mode == "prune_rm_fail" and target.parent.name == "Ice-backups.noindex":
+            fail()
         if target.is_symlink() or target.is_file():
             target.unlink()
         elif target.exists():
@@ -321,6 +323,72 @@ class InstallerTests(unittest.TestCase):
         self.assert_old()
         self.assertFalse(any(name in ("pkill", "open", "mv") for name, _ in self.events))
         self.assert_clean()
+
+    def make_backups(self, *names):
+        self.backups.mkdir(exist_ok=True)
+        for name in names:
+            (self.backups / name / "Contents").mkdir(parents=True)
+
+    def backup_names(self):
+        return sorted(p.name for p in self.backups.iterdir())
+
+    def test_prune_keeps_newest_five(self):
+        # The -2 backup is newer than the plain one from the same second.
+        self.make_backups("Ice-20261027-090000.app", "Ice-20261028-100000.app", "Ice-20261028-100000-2.app",
+                          "Ice-20261028-110000.app", "Ice-20261028-120000.app", "Ice-20261028-130000.app")
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual(self.backup_names(), ["Ice-20261028-100000-2.app", "Ice-20261028-110000.app",
+                                               "Ice-20261028-120000.app", "Ice-20261028-130000.app",
+                                               "Ice-20261029-120000.app"])
+        self.assertEqual((self.backup / "Contents/version").read_text(), "old")
+        removed = [args[-1] for name, args in self.events if name == "rm" and "Ice-backups.noindex" in args[-1]]
+        self.assertEqual(sorted(Path(x).name for x in removed), ["Ice-20261027-090000.app", "Ice-20261028-100000.app"])
+        self.assert_clean()
+
+    def test_prune_leaves_five_or_fewer_alone(self):
+        self.make_backups(*(f"Ice-20261028-10000{n}.app" for n in range(4)))
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual(len(self.backup_names()), 5)
+        self.assertFalse(any(name == "rm" and "Ice-backups.noindex" in args[-1] for name, args in self.events))
+
+    def test_prune_ignores_foreign_entries(self):
+        self.make_backups(*(f"Ice-20261028-10000{n}.app" for n in range(6)), "Ice-old.app", "Ice-20261028-100000-100.app")
+        (self.backups / "Ice-20261001-000000.app").write_text("a file, not a backup")
+        (self.backups / "Ice-20261002-000000.app").symlink_to(self.root / "missing")
+        (self.backups / "notes.txt").write_text("keep")
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual(self.backup_names(), ["Ice-20261001-000000.app", "Ice-20261002-000000.app",
+                                               "Ice-20261028-100000-100.app", "Ice-20261028-100002.app",
+                                               "Ice-20261028-100003.app", "Ice-20261028-100004.app",
+                                               "Ice-20261028-100005.app", "Ice-20261029-120000.app",
+                                               "Ice-old.app", "notes.txt"])
+
+    def test_prune_honors_keep_setting(self):
+        self.make_backups("Ice-20261028-100000.app", "Ice-20261028-110000.app")
+        self.env["ICE_KEEP_BACKUPS"] = "2"
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual(self.backup_names(), ["Ice-20261028-110000.app", "Ice-20261029-120000.app"])
+
+    def test_prune_invalid_keep_setting_removes_nothing(self):
+        self.make_backups(*(f"Ice-20261028-10000{n}.app" for n in range(6)))
+        self.env["ICE_KEEP_BACKUPS"] = "0"
+        self.assertEqual(self.run_install().returncode, 0, self.result.stdout)
+        self.assertEqual(len(self.backup_names()), 7)
+        self.assertIn("ICE_KEEP_BACKUPS must be a positive number", self.result.stdout)
+
+    def test_prune_failure_only_warns(self):
+        self.make_backups(*(f"Ice-20261028-10000{n}.app" for n in range(6)))
+        self.assertEqual(self.run_install("prune_rm_fail").returncode, 0, self.result.stdout)
+        self.assertEqual((self.dest / "Contents/version").read_text(), "new")
+        self.assertIn("WARN: Could not remove old backup", self.result.stdout)
+        self.assertEqual(len(self.backup_names()), 7)
+        self.assert_clean()
+
+    def test_failed_install_does_not_prune(self):
+        self.make_backups(*(f"Ice-20261028-10000{n}.app" for n in range(6)))
+        self.assertEqual(self.run_install("copy_fail").returncode, 23)
+        self.assert_old()
+        self.assertEqual(len(self.backup_names()), 6)
 
     def test_failed_first_install_removes_partial_app(self):
         shutil.rmtree(self.dest)

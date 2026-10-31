@@ -441,6 +441,50 @@ ditto --norsrc --noextattr "$STAGED_APP_PATH" "$DESTINATION_APP_PATH"
 codesign --verify --deep --strict "$DESTINATION_APP_PATH"
 INSTALL_DONE=1
 
+# Keep only the newest backups. Runs after a verified install, so a failure here
+# only warns. Touches nothing but real folders named like our own backups.
+prune_backups() {
+  local keep="${ICE_KEEP_BACKUPS:-5}"
+  [[ "$keep" =~ ^[1-9][0-9]*$ ]] || { echo "  WARN: ICE_KEEP_BACKUPS must be a positive number; no backups removed."; return 0; }
+  [[ -d "$backup_dir" && ! -L "$backup_dir" ]] || return 0
+  # Byte order for [[ < ]], whatever the user's locale.
+  local LC_ALL=C
+  local entry name suffix key
+  local -a keys=()
+  for entry in "$backup_dir"/Ice-*.app; do
+    name="${entry##*/}"
+    [[ "$name" =~ ^Ice-([0-9]{8}-[0-9]{6})(-([0-9]{1,2}))?\.app$ ]] || continue
+    [[ -d "$entry" && ! -L "$entry" ]] || continue
+    suffix="${BASH_REMATCH[3]:-1}"
+    # Sortable key: timestamp, then -2, -3 ... after the plain name.
+    printf -v key '%s-%02d' "${BASH_REMATCH[1]}" "$suffix"
+    keys+=("$key/$name")
+  done
+  (( ${#keys[@]} > keep )) || return 0
+  # Newest first (insertion sort: the installer's PATH has no sort).
+  local i j current
+  for ((i = 1; i < ${#keys[@]}; i++)); do
+    current="${keys[i]}"
+    for ((j = i - 1; j >= 0; j--)); do
+      [[ "${keys[j]}" < "$current" ]] || break
+      keys[j + 1]="${keys[j]}"
+    done
+    keys[j + 1]="$current"
+  done
+  echo "=== Removing old backups (keeping newest $keep) ==="
+  for ((i = keep; i < ${#keys[@]}; i++)); do
+    entry="$backup_dir/${keys[i]#*/}"
+    # Never remove the backup this run just made, even with a skewed clock.
+    [[ "$entry" != "$backup_path" ]] || continue
+    if rm -rf "$entry"; then
+      echo "  Removed $entry"
+    else
+      echo "  WARN: Could not remove old backup $entry"
+    fi
+  done
+}
+prune_backups
+
 if [[ "${ICE_INSTALL_NO_LAUNCH:-0}" != "1" ]]; then
   echo "=== Launching ==="
   open "$DESTINATION_APP_PATH"

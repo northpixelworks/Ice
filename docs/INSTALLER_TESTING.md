@@ -52,6 +52,10 @@ harness self-test for the `..` guard):
 | Failed first copy or first verification | Remove incomplete app when there was no previous installation; if removal fails, report the app path |
 | Backup collision: directory, file, dangling symlink (e.g. two installs in the same second) | Use the next free `-2`, `-3`, ... name and install; leave the collision untouched |
 | No free backup name up to `-99` | Abort before stop/move; leave old app and every collision untouched |
+| More than 5 backups after a verified install (`ICE_KEEP_BACKUPS` overrides 5) | Remove the oldest; `-2`, `-3` count as newer than the plain name of the same second; never the backup just made |
+| Foreign entries in the backup folder (other names, files, symlinks, `-100` suffix) | Ignored: not counted and never removed |
+| Invalid `ICE_KEEP_BACKUPS`, or removing an old backup fails | Warn only; install still succeeds |
+| Install fails | Nothing is pruned |
 | Moving old app to backup fails, or creating the backup folder fails | Existing app retained; staging cleaned; failure status preserved |
 | Backup move fails after writing a partial backup (cross-filesystem `mv` copies) | Existing app retained, never replaced by the partial backup |
 | SIGTERM (e.g. closed terminal) while the backup `mv` is still running, right after it, or during the destination copy | Wait for the running command, then restore the old fixture; relaunch only if stopped; exit by the signal |
