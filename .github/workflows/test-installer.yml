@@ -32,6 +32,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      # The tests run the installer with the first bash on PATH; log which one.
+      - name: Show bash version
+        run: |
+          command -v bash
+          bash --version | head -n 1
       - name: Check shell syntax
         run: bash -n build-and-install.sh
       - name: Run isolated installer tests
